@@ -1168,6 +1168,9 @@ struct common_prompt_checkpoint {
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
+    // checkpoint right after a media chunk, exempt from min-step spacing and eviction
+    bool after_media = false;
+
     llama_pos pos_min;
     llama_pos pos_max;
 

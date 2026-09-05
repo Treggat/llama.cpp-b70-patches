@@ -179,3 +179,33 @@ def test_vision_embeddings(prompt, image_data, success):
         assert content[0]['embedding'] != content[2]['embedding']
     else:
         assert res.status_code != 200
+
+
+def test_vision_checkpoint_after_image():
+    # two prompts share the image and differ in the text after it; on a model that needs
+    # context checkpoints (SWA) the second one must rewind to right after the image
+    # instead of re-processing it, which needs a checkpoint at that boundary
+    global server
+    server.n_ctx = 4096
+    server.n_batch = 2048
+    server.n_predict = 4
+    server.n_slots = 1
+    server.start()
+
+    def image_then(text):
+        return [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": get_img_url("IMG_URL_0")}},
+            {"type": "text", "text": text},
+        ]}]
+
+    def chat(messages):
+        res = server.make_request("POST", "/chat/completions", data={
+            "temperature": 0.0, "top_k": 1, "max_tokens": 4, "messages": messages,
+        })
+        assert res.status_code == 200
+        return res.body
+
+    body1 = chat(image_then("What is this? Answer in one word."))
+    assert body1["timings"]["cache_n"] == 0
+    body2 = chat(image_then("Which colors do you see? Answer in one word."))
+    assert body2["timings"]["cache_n"] >= 256, body2["timings"]  # tinygemma3 image = 256 tokens
