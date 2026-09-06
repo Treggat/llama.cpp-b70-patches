@@ -296,7 +296,8 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // `keep` is the cached state that is going to be loaded into this slot right after saving (see server_prompt_cache::alloc)
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_prompt_cache_state * keep = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -309,7 +310,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep);
         if (cur == nullptr) {
             return false;
         }
@@ -1634,17 +1635,38 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
-
             // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool can_cache = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // a cached state that covers more of the new prompt than the selected slot does: switch to it even when
+            // the slot would keep most of its own context (f_keep >= 0.5). this is the case of returning to a long
+            // conversation from a shorter one that shares the same prefix (e.g. the system prompt) - without the
+            // switch, everything after the shared prefix is re-processed although the full state sits in the cache
+            const server_prompt_cache_state * better = nullptr;
+
+            if (can_cache) {
+                const auto it = prompt_cache->find_better(ret->prompt, task.tokens);
+
+                if (it != prompt_cache->states.end()) {
+                    better = &*it;
+
+                    if (!update_cache) {
+                        SLT_INF(*ret, "prompt cache has a better match (%d tokens), switching to it\n", (int) it->prompt.tokens.size());
+                    }
+
+                    update_cache = true;
+                }
+            }
+
+            update_cache = update_cache && can_cache;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // note: `better` is protected from eviction while the current state is being saved
+                ret->prompt_save(*prompt_cache, better);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();

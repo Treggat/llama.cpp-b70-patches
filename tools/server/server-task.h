@@ -627,7 +627,14 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // find the cached state that would be a better starting point for tokens_new than `prompt`:
+    // it has to cover more of the new prompt (f_sim) AND keep more of its own tokens (f_keep)
+    // returns states.end() when the current prompt is already the best option
+    std::list<server_prompt_cache_state>::iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new);
+
+    // `keep` is a cached state that the caller is going to load() right after this call:
+    // it is never evicted to make room and its size counts as reclaimable, since load() removes it from the cache
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_prompt_cache_state * keep = nullptr);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

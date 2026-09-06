@@ -1708,7 +1708,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_prompt_cache_state * keep) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1736,7 +1736,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int len = &*it != keep ? it->prompt.tokens.get_common_prefix(prompt.tokens) : -1;
 
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
@@ -1748,12 +1748,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+        // the state that is about to be loaded leaves the cache right after this call - its size is reclaimable
+        const size_t size_keep = keep ? keep->size() : 0;
 
-            states.pop_front();
+        // make room before allocating the new vectors to avoid breaching the limit
+        // note: never evict `keep` - it is the state that the caller is switching to
+        while (size() - size_keep + state_size_new > limit_size) {
+            auto it = states.begin();
+            while (it != states.end() && &*it == keep) {
+                ++it;
+            }
+
+            if (it == states.end()) {
+                break;
+            }
+
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    it->size() / (1024.0 * 1024.0));
+
+            states.erase(it);
         }
     }
 
@@ -1790,7 +1803,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1824,7 +1837,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    }
 
+    return it_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    auto it_best = find_better(prompt, tokens_new);
+
+    if (it_best != states.end()) {
         {
             auto & data = it_best->data.main;
 
@@ -1858,6 +1879,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.shrink_to_fit();
             }
         }
+
+        SRV_INF(" - restored prompt from cache: %d tokens, %d in common with the new prompt (%d tokens)\n",
+                (int) it_best->prompt.tokens.size(), it_best->prompt.tokens.get_common_prefix(tokens_new), (int) tokens_new.size());
 
         prompt = std::move(it_best->prompt);
 
