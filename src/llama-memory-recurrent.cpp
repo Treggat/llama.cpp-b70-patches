@@ -656,9 +656,16 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
-            // What should happen when the pos backtracks or skips a value?
-            // Clearing the state mid-batch would require special-casing which isn't done.
+        // mrope repeats one position across an image and resumes text at pos + max(nx, ny),
+        // so a non-unit position delta is expected there and is harmless for this cache: the
+        // recurrent state is a running accumulator and does not index by position. Only a
+        // backtrack can leave the state ahead of the batch, so warn on that alone.
+        // Clearing the state mid-batch would require special-casing which isn't done.
+        const bool unexpected_pos = hparams.use_mrope()
+            ? last_pos < cell.pos
+            : last_pos != cell.pos + (llama_pos) n_seq_tokens;
+
+        if (cell.pos >= 0 && unexpected_pos) {
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
