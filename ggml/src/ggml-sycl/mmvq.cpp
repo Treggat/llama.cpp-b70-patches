@@ -24,6 +24,11 @@
 // every row count, so it does not consult this threshold.
 static constexpr int Q4_K_MMVQ_ROW_PAIR_MIN_NROWS = 6272;
 
+// Q4_K/Q6_K multi-column MMVQ with 5+ destination columns: four rows per subgroup win when a row is short
+// (k <= 8192: 1.5-1.65x vs one row on B70), two rows win on long rows (k 14336-17408, 4 rows is slower there).
+static constexpr int Q_K_MMVQ_4ROW_MAX_NCOLS = 8192;
+static constexpr int Q_K_MMVQ_4ROW_MIN_NROWS = 6144; // fewer rows leave too few subgroups (m=4096: 4 rows 1.14x, 2 rows 1.44x)
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                                   const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
@@ -1787,7 +1792,13 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
         const int ncols, const int nrows,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
-    constexpr int rows_per_sg = ncols_dst >= 3 && ncols_dst <= 4 ? 2 : 1;
+    if constexpr (ncols_dst >= 5) {
+        if (ncols <= Q_K_MMVQ_4ROW_MAX_NCOLS && nrows >= Q_K_MMVQ_4ROW_MIN_NROWS) {
+            reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_impl<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        }
+    }
+    constexpr int rows_per_sg = ncols_dst >= 3 ? 2 : 1;
     reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_impl<ncols_dst, rows_per_sg>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
 }
 
@@ -1962,26 +1973,43 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     });
 }
 
-template <int ncols_dst>
-static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
+template <int ncols_dst, int rows_per_sg>
+static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols_impl(
         const void * vx, const void * vy, float * dst,
         const int ncols, const int nrows,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     constexpr size_t num_subgroups = WARP_SIZE;
-    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups * rows_per_sg);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>, ncols_dst>(
+                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>, ncols_dst,
+                                                        /*has_fusion=*/ false, rows_per_sg>(
                                  vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
                                  /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
                          });
     });
+}
+
+template <int ncols_dst>
+static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    if constexpr (ncols_dst >= 5) {
+        if (ncols <= Q_K_MMVQ_4ROW_MAX_NCOLS && nrows >= Q_K_MMVQ_4ROW_MIN_NROWS) {
+            reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols_impl<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        }
+    }
+    constexpr int rows_per_sg = ncols_dst >= 3 ? 2 : 1;
+    reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols_impl<ncols_dst, rows_per_sg>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
 }
 
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl_switch_ncols(
