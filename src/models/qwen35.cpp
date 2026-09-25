@@ -113,6 +113,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
+
+        // optional draft-only LM head over the first n_draft vocab ids; the row count comes from the file
+        if (const ggml_tensor * dh_meta = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str().c_str())) {
+            layer.nextn.draft_head = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il), { n_embd, dh_meta->ne[1] }, mtp_flags|TENSOR_NOT_REQUIRED);
+        }
     };
 
     for (int i = 0; i < n_layer; ++i) {
@@ -636,7 +641,29 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // draft over the first n_sub vocab ids only (low ids are the frequent BPE tokens): the rest of the row gets
+    // -1e30, so the drafter never proposes them; the target still verifies over the full vocab.
+    // Prefer a separate nextn.draft_head tensor. A row view of the full head is only safe for non-quantized
+    // heads: backends may reorder quantized weights (e.g. SYCL keeps scales after all rows of the tensor).
+    static const int64_t n_sub_env = getenv("LLAMA_MTP_DRAFT_VOCAB") ? atoll(getenv("LLAMA_MTP_DRAFT_VOCAB")) : 0;
+    const int64_t n_vocab_head = head_w->ne[1];
+    ggml_tensor * head_sub = nullptr;
+    if (layer.nextn.draft_head && layer.nextn.draft_head->ne[1] < n_vocab_head) {
+        head_sub = layer.nextn.draft_head;
+    } else if (n_sub_env > 0 && n_sub_env < n_vocab_head && !ggml_is_quantized(head_w->type)) {
+        head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_sub_env, head_w->nb[1], 0);
+    }
+    if (head_sub) {
+        cur = build_lora_mm(head_sub, cur, head_sub == layer.nextn.draft_head ? nullptr : head_s);
+        const int n_pad = (int) (n_vocab_head - head_sub->ne[1]);
+        // 1 over the subset, 0 over the padded tail -> bias 0 / -1e30 (fill needs a contiguous tensor, so no view)
+        ggml_tensor * keep = ggml_pad(ctx0, ggml_fill(ctx0, cur, 1.0f), n_pad, 0, 0, 0);
+        ggml_tensor * bias = ggml_scale_bias(ctx0, keep, 1e30f, -1e30f);
+        cur = ggml_add(ctx0, ggml_pad(ctx0, cur, n_pad, 0, 0, 0), bias);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

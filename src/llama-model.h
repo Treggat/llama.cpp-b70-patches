@@ -230,6 +230,7 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * draft_head            = nullptr; // optional: first n rows of the LM head, used only to draft
     struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
