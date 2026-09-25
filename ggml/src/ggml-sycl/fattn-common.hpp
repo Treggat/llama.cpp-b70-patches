@@ -1075,7 +1075,12 @@ void launch_fattn(
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
+        // On Xe2 (BMG) one wave of nsm*max_wg_per_cu blocks is too few to saturate memory for GQA decode.
+        // Measured: 1.4-3.3x faster for ncols2 2..8, slower for ncols2 1 (VEC) and 16.
+        const gpu_arch arch     = ggml_sycl_info().devices[id].hw_info.arch;
+        const bool     is_bmg   = arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
+        const int      wave_mult = is_bmg && ncols2 >= 2 && ncols2 <= 8 ? 4 : 1;
+        const int blocks_per_wave = nsm * max_blocks_per_sm * wave_mult;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
