@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "ggml.h"
+#include "mmq-xmx-q4k.hpp"
 
 template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
 static void k_bin_bcast(const src0_t * src0, const src1_t * src1, dst_t * dst,
@@ -104,6 +108,9 @@ struct bin_bcast_sycl {
         int nr3 = ne13/ne3;
 
         int nr[4] = { nr0, nr1, nr2, nr3 };
+
+        // rows = tokens for a [n_embd, n_tokens] activation; only wide rows (the hidden state) take part
+        [[maybe_unused]] const bool glue_grf256 = ne0 >= 1024 && ggml_sycl_xmx_glue_grf256(GGML_SYCL_XMX_GLUE_ADD, ne1 * ne2 * ne3);
 
         // collapse dimensions until first broadcast dimension
         int64_t cne[] = {ne0, ne1, ne2, ne3};
@@ -244,6 +251,23 @@ struct bin_bcast_sycl {
                 */
                 dpct::has_capability_or_fail(stream->get_device(),
                                              {sycl::aspect::fp16});
+
+                // GGML_SYCL_XMX_GLUE (default off): wide f32 binary ops (the residual add between XMX matmuls) in the
+                // 256-register mode of the matmuls, so the GPU does not switch modes around them
+                if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+                    if (glue_grf256) {
+                        stream->parallel_for(
+                            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                            sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                            [=](sycl::nd_item<3> item_ct1) {
+                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1,
+                                                    ne2, ne3, ne10, ne11, ne12, ne13,
+                                                    s1, s2, s3, s00, s01, s02, s03, s10, s11, s12, s13,
+                                                    item_ct1);
+                            });
+                        return;
+                    }
+                }
 
                 stream->parallel_for(
                     sycl::nd_range<3>(block_nums * block_dims, block_dims),

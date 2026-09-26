@@ -31,6 +31,11 @@
 #include <stdlib.h>
 #include <regex>
 
+#include <utility>
+#include <chrono>
+#include <map>
+#include <string>
+#include <cstdio>
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
@@ -61,6 +66,10 @@
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/mmq-dnn-u4.hpp"
+#include "ggml-sycl/mmq-xmx-q4k.hpp"
+#include "ggml-sycl/mmq-xmx-q6k.hpp"
+#include "ggml-sycl/fattn-xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -438,11 +447,34 @@ static void ggml_check_sycl() try {
 
 #if defined(GGML_SYCL_DNNL)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_DNN_U4: %d\n", (int) ggml_sycl_dnn_u4_enabled());
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #endif
+        if (ggml_sycl_xmx_q4k_built()) {
+            // probes (and caches) the matrix hardware per device before any XMX kernel can be submitted
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q4K: %d (built, matrix s8:", (int) ggml_sycl_xmx_q4k_env());
+            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count() && i < GGML_SYCL_MAX_DEVICES; ++i) {
+                GGML_LOG_INFO(" dev%u %s", i, ggml_sycl_xmx_q4k_device_ok((int) i) ? "YES" : "NO");
+            }
+            GGML_LOG_INFO(")\n");
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (built, same matrix check)\n", (int) ggml_sycl_xmx_q6k_env());
+        } else {
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q4K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q4k_env());
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q6k_env());
+        }
+        if (ggml_sycl_xmx_q4k_built()) {
+            // same build switch; probes (and caches) the f16 matrix combination per device
+            GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (built, matrix f16:", (int) ggml_sycl_fattn_xmx_env());
+            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count() && i < GGML_SYCL_MAX_DEVICES; ++i) {
+                GGML_LOG_INFO(" dev%u %s", i, ggml_sycl_fattn_xmx_device_ok((int) i) ? "YES" : "NO");
+            }
+            GGML_LOG_INFO(")\n");
+        } else {
+            GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_fattn_xmx_env());
+        }
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MAX_KV: %d\n", g_ggml_sycl_fa_onednn_max_kv);
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
@@ -4824,6 +4856,55 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    // q4_K x 3..16 columns (env window) on the XMX matrix units (mmq-xmx-q4k.cpp): reads the MMVQ reorder layout in place and
+    // quantizes the activations exactly as MMVQ's q8_1 quantizer does, so it coexists with MMVQ (1 column) and every
+    // reorder-aware path. Default off (GGML_SYCL_XMX_Q4K=1); exclusive with the oneDNN u4 repack.
+    if (!split && ggml_sycl_xmx_q4k_can_use(ctx, src0, src1, dst)) {
+        // the same reorder the MMVQ branch below installs (a no-op once done), not a new repack; installed here
+        // whatever the column count, since should_reorder_tensor() stops at 8 and this path serves up to 16
+        opt_for_reorder_id(&ctx, src0);
+        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (extra && extra->optimized_feature.reorder) {
+            if (ggml_sycl_xmx_q4k_path() == 1) {
+                ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx_q4k);
+            } else {
+                // two launches (fused quantize, matmul) straight on the stream, no q8_1 SoA buffer
+                ggml_sycl_mul_mat_xmx_q4k(ctx, src0, src1, dst);
+            }
+            return;
+        }
+        // no reorder (GGML_SYCL_ENABLE_OPT=0, device without the reorder feature, or it failed): the standard
+        // layout stays on MMVQ below
+    }
+
+    // q6_K x 3..8 columns on the XMX matrix units (mmq-xmx-q6k.cpp): same scheme as q4_K above (MMVQ reorder layout
+    // read in place, the same SoA q8_1 activations); small weights stay on MMVQ (can_use's minimum-work guards).
+    // Default off (GGML_SYCL_XMX_Q6K=1).
+    if (!split && ggml_sycl_xmx_q6k_can_use(ctx, src0, src1, dst)) {
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (extra && extra->optimized_feature.reorder) {
+            if (ggml_sycl_xmx_q6k_path() == 1) {
+                ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx_q6k);
+            } else {
+                // two launches (fused quantize, matmul) straight on the stream, no q8_1 SoA buffer
+                ggml_sycl_mul_mat_xmx_q6k(ctx, src0, src1, dst);
+            }
+            return;
+        }
+    }
+
+    // q4_K on oneDNN's u4 weight-decompression matmul: flat in the column count, so it takes every column count
+    // once a tensor has been repacked (mmq-dnn-u4.cpp)
+    if (!split && ggml_sycl_dnn_u4_can_use(ctx, src0, src1, dst) && ggml_sycl_dnn_u4_prepare(ctx, src0)) {
+        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_dnn_u4);
+        return;
+    }
+    if (ggml_sycl_dnn_u4_is_repacked(src0)) {
+        GGML_ABORT("%s: %s is in the oneDNN u4 layout but this mul_mat (src1 %s %lldx%lldx%lld, dst %s) cannot use that path",
+                   __func__, src0->name, ggml_type_name(src1->type), (long long) src1->ne[0], (long long) src1->ne[1],
+                   (long long) src1->ne[2], ggml_type_name(dst->type));
+    }
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
@@ -4868,7 +4949,8 @@ static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, gg
     // weights already migrated to the reorder layout would be misread by the plain kernel
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
     const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
-    if ((extra_u && extra_u->optimized_feature.reorder) || (extra_g && extra_g->optimized_feature.reorder)) {
+    if ((extra_u && (extra_u->optimized_feature.reorder || extra_u->optimized_feature.dnn_u4)) ||
+        (extra_g && (extra_g->optimized_feature.reorder || extra_g->optimized_feature.dnn_u4))) {
         return false;
     }
 
@@ -4926,6 +5008,10 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
     }
 
+    // q4_K pairs go to the oneDNN u4 path when it is on; never install the MMVQ layout under it
+    if (ggml_sycl_dnn_u4_enabled()) {
+        return false;
+    }
     // install the reorder (SoA) layout the fused kernel needs, as the unfused mmvq path would;
     // a no-op once done. after the bail checks so a declined op does not pay for it.
     opt_for_reorder(&ctx, wu, act, up, mul_mat_algo::MMVQ);
@@ -4934,6 +5020,15 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
     const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
     if (!extra_u || !extra_g || !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
+        return false;
+    }
+    // q4_K pairs inside the XMX column window go to the XMX path when it is on: the two mul_mats then run unfused
+    // through ggml_sycl_mul_mat (XMX) and the GLU as its own op (flat in the column count, faster than fused MMVQ)
+    if (ggml_sycl_xmx_q4k_can_use(ctx, wu, act, up) && ggml_sycl_xmx_q4k_can_use(ctx, wg, act, gate)) {
+        return false;
+    }
+    // same for q6_K pairs on the XMX q6_K path (not in the house model; kept symmetric)
+    if (ggml_sycl_xmx_q6k_can_use(ctx, wu, act, up) && ggml_sycl_xmx_q6k_can_use(ctx, wg, act, gate)) {
         return false;
     }
 
@@ -6040,8 +6135,110 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+
+// ---- env-gated per-op profiler: GGML_SYCL_OP_PROFILE=N waits after every op, keys ops by name/type/batch,
+//      and prints cumulative per-graph-size tables every N graphs and at exit. Off (no cost) when unset. ----
+struct ggml_sycl_op_prof_acc { double ms = 0; int64_t n = 0; };
+struct ggml_sycl_op_prof_bucket { int64_t graphs = 0; int64_t skipped = 0; double ms = 0; std::map<std::string, ggml_sycl_op_prof_acc> ops; };
+static std::map<std::pair<int, int64_t>, ggml_sycl_op_prof_bucket> g_sycl_op_prof; // (n_nodes, n_tokens)
+static ggml_sycl_op_prof_bucket * g_sycl_op_prof_cur = nullptr;
+static int64_t g_sycl_op_prof_total_graphs = 0;
+
+static void ggml_sycl_op_prof_print() {
+    for (auto & kv : g_sycl_op_prof) {
+        const auto & b = kv.second;
+        if (b.graphs == 0) continue;
+        fprintf(stderr, "[sycl-prof] graph n_nodes=%d n_tokens=%lld graphs=%lld (skipped %lld) avg=%.3f ms/graph\n", kv.first.first, (long long) kv.first.second, (long long) b.graphs, (long long) b.skipped, b.ms / b.graphs);
+        std::vector<std::pair<std::string, ggml_sycl_op_prof_acc>> rows(b.ops.begin(), b.ops.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & c) { return a.second.ms > c.second.ms; });
+        for (const auto & r : rows) {
+            fprintf(stderr, "[sycl-prof]   %-40s %9.3f ms/graph %5.1f%%  x%.1f/graph\n", r.first.c_str(),
+                    r.second.ms / b.graphs, 100.0 * r.second.ms / b.ms, (double) r.second.n / b.graphs);
+        }
+    }
+    fflush(stderr);
+}
+
+static int ggml_sycl_op_prof_mode() {
+    static int every = -1;
+    if (every < 0) {
+        const char * e = getenv("GGML_SYCL_OP_PROFILE");
+        every = e ? std::max(0, atoi(e)) : 0;
+        if (every > 0) {
+            std::atexit(ggml_sycl_op_prof_print);
+        }
+    }
+    return every;
+}
+
+static std::string ggml_sycl_op_prof_key(const ggml_tensor * node) {
+    std::string key = ggml_op_name(node->op);
+    if (node->op == GGML_OP_UNARY) {
+        key += std::string("_") + ggml_unary_op_name(ggml_get_unary_op(node));
+    } else if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        key += std::string("_") + ggml_type_name(node->src[0]->type) + "_n" + std::to_string(node->ne[1]);
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        key += "_kv" + std::to_string(node->src[1]->ne[1]) + "_n" + std::to_string(node->src[0]->ne[1]);
+    } else if (node->op == GGML_OP_GATED_DELTA_NET) {
+        key += "_n" + std::to_string(node->src[2]->ne[2]);
+    } else if (node->op == GGML_OP_SSM_CONV) {
+        key += "_n" + std::to_string(node->ne[1]);
+    }
+    return key;
+}
+
+struct ggml_sycl_op_prof_scope {
+    ggml_backend_sycl_context * ctx = nullptr;
+    std::string key;
+    std::chrono::steady_clock::time_point t0;
+    ggml_sycl_op_prof_scope(ggml_backend_sycl_context * c, const ggml_tensor * node) {
+        if (g_sycl_op_prof_cur == nullptr) return;
+        ctx = c;
+        key = ggml_sycl_op_prof_key(node);
+        ctx->stream()->wait();
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~ggml_sycl_op_prof_scope() {
+        if (ctx == nullptr) return;
+        ctx->stream()->wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        auto & acc = g_sycl_op_prof_cur->ops[key];
+        acc.ms += ms;
+        acc.n  += 1;
+        g_sycl_op_prof_cur->ms += ms;
+    }
+};
+
+static void ggml_sycl_op_prof_graph_begin(ggml_cgraph * cgraph) {
+    g_sycl_op_prof_cur = nullptr;
+    if (ggml_sycl_op_prof_mode() <= 0) return;
+    int64_t n_tokens = 0; // ne[1] of the first MUL_MAT = tokens in this graph
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
+    }
+    ggml_sycl_op_prof_bucket & b = g_sycl_op_prof[std::make_pair(cgraph->n_nodes, n_tokens)];
+    // skip the first GGML_SYCL_OP_PROFILE_SKIP graphs of each bucket (default 1): they carry kernel JIT + warmup
+    static const int skip = getenv("GGML_SYCL_OP_PROFILE_SKIP") ? atoi(getenv("GGML_SYCL_OP_PROFILE_SKIP")) : 1;
+    if (b.skipped < skip) {
+        b.skipped++;
+        return;
+    }
+    g_sycl_op_prof_cur = &b;
+}
+
+static void ggml_sycl_op_prof_graph_end() {
+    if (g_sycl_op_prof_cur == nullptr) return;
+    g_sycl_op_prof_cur->graphs++;
+    g_sycl_op_prof_cur = nullptr;
+    if (++g_sycl_op_prof_total_graphs % ggml_sycl_op_prof_mode() == 0) {
+        ggml_sycl_op_prof_print();
+    }
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    ggml_sycl_op_prof_graph_begin(cgraph);
+    ggml_sycl_dnn_u4_graph_begin(sycl_ctx->stream());
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6051,6 +6248,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        ggml_sycl_op_prof_scope prof_scope(sycl_ctx, node);
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
@@ -6144,6 +6343,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+    ggml_sycl_op_prof_graph_end();
 }
 
 #ifdef GGML_SYCL_GRAPH

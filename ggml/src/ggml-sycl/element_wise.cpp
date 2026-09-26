@@ -2,6 +2,9 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
 #include "element_wise.hpp"
+#include "mmq-xmx-q4k.hpp"
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #define SYCL_GLOBAL_ID_LOOP(K, ITEM) \
     for (auto i = ITEM.get_global_id(0); i < (size_t)K; i += ITEM.get_global_range(0))
@@ -665,7 +668,20 @@ static inline void ggml_sycl_op_unary_gated(
 
             // o0 == n and o1 == n make the index math the identity, so index flat
             // note: not ggml_is_contiguous - a fused [gate|up] src0 is contiguous with o0 == 2n
-            if (o0 == n && o1 == n) {
+            // GGML_SYCL_XMX_GLUE: run the gated op in the 256-register mode of the XMX q4_K matmuls around it (k / n
+            // rows = tokens), so the GPU does not switch register modes on either side of it
+            if (ggml_sycl_xmx_glue_grf256(GGML_SYCL_XMX_GLUE_GLU, n ? (int64_t) (k / n) : 0)) {
+                const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
+                main_stream->parallel_for(launch_range,
+                    sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                    [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        if (o0 == n && o1 == n) {
+                            unary_gated_op_flat_kernel(x_ptr, g_ptr, dst_ptr, k, item_ct1, func);
+                        } else {
+                            unary_gated_op_generic_kernel(x_ptr, g_ptr, dst_ptr, k, n_fd, o0, o1, item_ct1, func);
+                        }
+                    });
+            } else if (o0 == n && o1 == n) {
                 main_stream->parallel_for(launch_range,
                     [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                         unary_gated_op_flat_kernel(x_ptr, g_ptr, dst_ptr, k, item_ct1, func);

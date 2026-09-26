@@ -4913,6 +4913,52 @@ struct test_rwkv_wkv7 : public test_case {
 };
 
 // GGML_OP_MUL_MAT
+// LOCAL (not for upstream): a chain of `nl` 27B-class FFN blocks at a verify column count, for measuring what the
+// kernels between the matmuls cost (e.g. GPU register-mode switches around a 256-GRF matmul):
+//   x = x + down * swiglu(gate * rms_norm(x), up * rms_norm(x))      (the same three q4_K weights in every block)
+// nw = 1 multiplies the norm by a weight vector as the model does (the backend's fused rms_norm x mul kernel).
+// perf reports the whole chain per run (op_flops is inflated so the graph is not duplicated); divide by nl.
+struct test_ffn_chain : public test_case {
+    const ggml_type type_w;
+    const int64_t   n_embd, n_ff, n, nl;
+    const int       nw;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FFN_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR6(type_w, n_embd, n_ff, n, nl, nw); }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 1ULL << 50; }   // one run = the whole chain
+
+    test_ffn_chain(ggml_type type_w = GGML_TYPE_Q4_K, int64_t n_embd = 5120, int64_t n_ff = 17408, int64_t n = 4, int64_t nl = 8,
+                   int nw = 0)
+        : type_w(type_w), n_embd(n_embd), n_ff(n_ff), n(n), nl(nl), nw(nw) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, type_w, n_embd, n_ff);
+        ggml_tensor * up   = ggml_new_tensor_2d(ctx, type_w, n_embd, n_ff);
+        ggml_tensor * down = ggml_new_tensor_2d(ctx, type_w, n_ff, n_embd);
+        ggml_set_name(gate, "gate");
+        ggml_set_name(up, "up");
+        ggml_set_name(down, "down");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = nullptr;
+        if (nw) {
+            w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(w, "norm_w");
+        }
+        for (int64_t l = 0; l < nl; ++l) {
+            ggml_tensor * h = ggml_rms_norm(ctx, x, 1e-6f);
+            if (w) {
+                h = ggml_mul(ctx, h, w);
+            }
+            ggml_tensor * a = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, gate, h), ggml_mul_mat(ctx, up, h));
+            x = ggml_add(ctx, x, ggml_mul_mat(ctx, down, a));
+        }
+        ggml_set_name(x, "out");
+        return x;
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -9930,6 +9976,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t m : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
+    // LOCAL (not for upstream): wide q4_K weights so the SYCL oneDNN u4 path (rows >= 2048) is exercised
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {2048, 256}, {4096, 5120}, {17408, 5120}, {5120, 17408}, {10240, 5120} }) {
+        {
+            // q4_K also at 2/4/8 columns: the SYCL XMX path serves 2..8 (mmq-xmx-q4k.cpp)
+            for (int nc : { 1, 2, 4, 6, 8, 12, 16 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+                if (nc == 1 || nc == 6 || nc == 16) {
+                    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+                }
+            }
+        }
+    }
+    // LOCAL (not for upstream): q6_K at the house model's q6_K shapes (ffn_down 5120x17408, attn_qkv 10240x5120,
+    // attn_v 1024x5120) across the SYCL XMX q6_K column window (mmq-xmx-q6k.cpp, 3..8 by default)
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {5120, 17408}, {10240, 5120}, {1024, 5120} }) {
+        for (int nc : { 2, 3, 5, 7, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // LOCAL (not for upstream): SYCL XMX q4_K / q6_K edge shapes. K = 11*256 pads the q8_1 row to 3072 with the ds
+    // values at the unpadded K; 4100 rows is not a multiple of the 16-row tile, so XMX must decline and MMVQ serve it.
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int nc : { 2, 5, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, nc, 2816, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, nc, 1024, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // LOCAL (not for upstream): q4_K / q6_K gate/up + GLU at model-like rows. Inside the XMX column window (default
+    // 3..8) the SYCL fusion declines and the pair runs as two XMX mul_mats + GLU; at 2 columns it stays fused MMVQ.
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+            for (int64_t m_batch : { 2, 6 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, glu_op, m_batch, 4096, 1024,
+                    false, 16, 8, false, false, true, false, { 1, 1 }));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -10727,6 +10810,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // LOCAL (xmx-fa probe): Qwen3.8-27B seat decode/verify shapes, real KV-cache layout.
+    for (int kv : { 4096, 32768, }) {
+        for (int nb : { 1, 2, 4, 6, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
+    // LOCAL (xmx-fa): the remaining SYCL XMX FA row tilings (odd token counts run unsplit: nb 3/5/7 -> 18/30/42 rows;
+    // GQA 8 x 5 -> 40 rows, GQA 16 x 3 -> 48 rows), a KV length whose last split-KV chunk is partial (4160 = 65 x 64),
+    // and a KV-cache view (kv_view: token stride of a 2x longer buffer)
+    for (int nb : { 3, 5, 7, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -11085,6 +11184,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // LOCAL (not for upstream): model-shape q4_K matmuls at verify column counts (SYCL oneDNN u4 path vs MMVQ)
+    // (1024x5120: small-weight check for the XMX column window, as for q6_K below)
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {1024, 5120} }) {
+        for (int nc : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // LOCAL: 8 chained 27B-class FFN blocks (q4_K) at verify column counts
+    // (nw 1: rms_norm x weight, the model's fused norm kernel)
+    for (int nw : { 0, 1 }) {
+        for (int nc : { 1, 4, 6 }) {
+            test_cases.emplace_back(new test_ffn_chain(GGML_TYPE_Q4_K, 5120, 17408, nc, 8, nw));
+        }
+    }
+    // LOCAL (not for upstream): the house model's q6_K shapes (ffn_down, attn_qkv, attn_v) at 1..8 columns
+    // (SYCL XMX q6_K path vs MMVQ)
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {5120, 17408}, {10240, 5120}, {1024, 5120} }) {
+        for (int nc = 1; nc <= 8; ++nc) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -11360,6 +11481,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // LOCAL (xmx-fa probe): Qwen3.8-27B seat decode/verify shapes. hs 256, 4 KV heads, GQA 6,
+    // real KV-cache layout (permute {0,2,1,3}, no view: K nb1 = 4*256*2 = 2048, nb2 = 512), f16 KV.
+    for (int kv : { 4096, 32768, 49152, 65536, 131072, }) {
+        for (int nb : { 1, 2, 3, 4, 5, 6, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 576, }) {

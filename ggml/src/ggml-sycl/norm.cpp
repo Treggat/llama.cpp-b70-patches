@@ -1,6 +1,10 @@
 #include "norm.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/mmq-xmx-q4k.hpp"
+
+#include <algorithm>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 static void norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
@@ -353,6 +357,37 @@ static void group_norm_f32_sycl(const float* x, float* dst,
     }
 }
 
+// one work-group per row, `wg` work-items, wg / WARP_SIZE floats of SLM; kern(item, s_sum, wg).
+// GGML_SYCL_XMX_GLUE (default off): the wide-row rms_norm kernels (ncols >= 1024: plain, x mul, x mul + add) run in
+// the 256-register mode of the XMX matmuls around them, so the GPU does not switch register modes on either side.
+// That mode halves the threads per XVE, so the work-group is capped at 512.
+template <typename K>
+static void rms_norm_submit_wide(queue_ptr stream, const sycl::range<3> & global_dims, int device, K kern) {
+    const bool grf256 = ggml_sycl_xmx_glue_grf256(GGML_SYCL_XMX_GLUE_NORM,
+                                                  (int64_t) (global_dims[0] * global_dims[1] * global_dims[2]));
+    int wg = ggml_sycl_info().max_work_group_sizes[device];
+    if (grf256) {
+        wg = std::min(wg, 512);
+    }
+    assert(wg % (WARP_SIZE * WARP_SIZE) == 0);
+    const sycl::range<3> block_dims(1, 1, wg);
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s_sum(sycl::range<1>(wg / WARP_SIZE), cgh);
+        if (grf256) {
+            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                             sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 kern(it, get_pointer(s_sum), wg);
+                             });
+        } else {
+            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 kern(it, get_pointer(s_sum), wg);
+                             });
+        }
+    });
+}
+
 static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
@@ -375,27 +410,12 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
-        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:19: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        stream->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE),
-                cgh);
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
-                });
-            });
+        rms_norm_submit_wide(stream, global_dims, device, [=](const sycl::nd_item<3> & item_ct1, float * s_sum, int wg) {
+            rms_norm_f32(x, dst, ncols,
+                src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+                dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                eps, item_ct1, s_sum, wg);
+        });
     }
 }
 
@@ -469,22 +489,13 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
-        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        stream->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
-                });
-            });
+        rms_norm_submit_wide(stream, global_dims, device, [=](const sycl::nd_item<3> & item_ct1, float * s_sum, int wg) {
+            rms_norm_f32<true>(x, dst, ncols,
+                src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+                dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                eps, item_ct1, s_sum, wg,
+                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
+        });
     }
 }
 
@@ -515,23 +526,14 @@ static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const fl
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
-        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        stream->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true, true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples);
-                });
-            });
+        rms_norm_submit_wide(stream, global_dims, device, [=](const sycl::nd_item<3> & item_ct1, float * s_sum, int wg) {
+            rms_norm_f32<true, true>(x, dst, ncols,
+                src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+                dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                eps, item_ct1, s_sum, wg,
+                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples);
+        });
     }
 }
 

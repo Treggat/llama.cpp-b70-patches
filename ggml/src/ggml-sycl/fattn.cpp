@@ -19,6 +19,7 @@
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
+#include "fattn-xmx.hpp"
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -100,6 +101,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
+    BEST_FATTN_KERNEL_XMX      = 400, // joint_matrix decode/verify kernel (fattn-xmx.cpp), GGML_SYCL_XMX_FA=1
 };
 
 
@@ -172,6 +174,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         if (kv_strides_ok) {
             return BEST_FATTN_KERNEL_MKL;
         }
+    }
+
+    // XMX decode/verify path (fattn-xmx.cpp): small query batches (2..8 tokens by default) over a long f16 KV cache,
+    // head dim 256, GQA x tokens <= 48. Opt-in (GGML_SYCL_XMX_FA=1); the oneDNN/MKL checks above only take nb >= 32.
+    if (ggml_sycl_fattn_xmx_can_use(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX;
     }
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
@@ -292,6 +300,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
+        if (k == BEST_FATTN_KERNEL_XMX)  kname = "XMX";
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -327,6 +336,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_fattn_xmx(ctx, dst);
+            break;
     }
 
     // --- Output fingerprint (GGML_SYCL_MKL_FA_DIAG=1) ---
@@ -351,6 +363,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             if (kb == BEST_FATTN_KERNEL_MKL) kname = "MKL";
             if (kb == BEST_FATTN_KERNEL_TILE) kname = "TILE";
             if (kb == BEST_FATTN_KERNEL_VEC) kname = "VEC";
+            if (kb == BEST_FATTN_KERNEL_XMX) kname = "XMX";
             GGML_LOG_INFO("[FA-DIAG] #%d %s D=%d n_kv=%lld n_q=%lld "
                     "n_qh=%lld n_kvh=%lld K=%s V=%s "
                     "nb1=%zu nb2=%zu first 64 floats:\n",

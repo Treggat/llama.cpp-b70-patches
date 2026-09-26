@@ -157,6 +157,15 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             ggml_sycl_set_device(i);
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(extra->data_device[i], *(streams[i]))));
         }
+        if (extra->dnn_scales != nullptr && extra->dnn_scales_device == i && streams.size() > 0) {
+            ggml_sycl_set_device(i);
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(extra->dnn_scales, *(streams[i]))));
+            extra->dnn_scales = nullptr;
+            if (extra->dnn_mins != nullptr) {
+                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(extra->dnn_mins, *(streams[i]))));
+                extra->dnn_mins = nullptr;
+            }
+        }
     }
     delete extra;
 }

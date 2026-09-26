@@ -164,6 +164,16 @@ else()
 endif()
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 
+# joint_matrix (XMX) q4_K and q6_K paths (mmq-xmx-q4k.cpp, mmq-xmx-q6k.cpp). Off by default: the kernels only run on a runtime that reports
+# aspect::ext_intel_matrix (oneAPI 2026.1 on Battlemage), and are also gated at run time by GGML_SYCL_XMX_Q4K=1 / GGML_SYCL_XMX_Q6K=1.
+# The same switch builds the joint_matrix flash-attention decode path (fattn-xmx.cpp, run time GGML_SYCL_XMX_FA=1).
+if (GGML_SYCL_XMX)
+    message(STATUS "SYCL XMX q4_K/q6_K + flash-attention paths: enabled")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX=1)
+else()
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX=0)
+endif()
+
 if (GGML_SYCL_F16)
     add_compile_definitions(GGML_SYCL_F16)
 endif()

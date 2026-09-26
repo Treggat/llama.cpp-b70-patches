@@ -214,6 +214,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
+    bool dnn_u4=false;   // q4_K repacked for the oneDNN u4 matmul (mmq-dnn-u4.cpp)
 };
 
 struct sycl_device_info {
@@ -318,6 +319,9 @@ struct ggml_tensor_extra_gpu {
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
+  void * dnn_scales = nullptr;    // f16 group scales [K/32][N] for the oneDNN u4 path
+  void * dnn_mins = nullptr;      // u8 6-bit group mins [N][K/32] for the u4 min correction (same device as dnn_scales)
+  int    dnn_scales_device = -1;
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
