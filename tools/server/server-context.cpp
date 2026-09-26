@@ -2861,10 +2861,30 @@ private:
             }
         }
 
+        // [step-prof] per-phase wall clocks of a generation step (small batches only), env LLAMA_HOST_PROF
+        static int64_t hp_prev_end = 0;
+        const bool hprof = llama_hprof_enabled();
+        const int64_t hp_start = hprof ? ggml_time_us() : 0;
+        struct hp_end_guard {
+            bool on; int64_t t0; server_batch * b;
+            ~hp_end_guard() {
+                if (on && b->size() > 0 && b->size() <= 16) {
+                    llama_hprof_record("srv.update_slots", t0);
+                }
+                if (on) hp_prev_end = ggml_time_us();
+            }
+        } hp_guard { hprof, hp_start, &batch };
+        if (hprof && hp_prev_end > 0 && hp_start - hp_prev_end < 50000) {
+            llama_hprof_record("srv.loop_gap", hp_prev_end);
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
+            if (hprof && batch.size() > 0 && batch.size() <= 16) {
+                llama_hprof_record("srv.pre_decode(incl draft)", hp_start);
+            }
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -2904,7 +2924,11 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
+                const int64_t hp_t0 = (hprof && n_tokens <= 16) ? ggml_time_us() : 0;
                 bool ok = decode(n_batch, off, batch_view);
+                if (hp_t0) {
+                    llama_hprof_record("srv.decode_fn", hp_t0);
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -2927,7 +2951,11 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const int64_t hp_t0 = (hprof && n_tokens <= 16) ? ggml_time_us() : 0;
                 post_decode(n_tokens, off, batch_view);
+                if (hp_t0) {
+                    llama_hprof_record("srv.post_decode", hp_t0);
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3079,9 +3107,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (hp_t0) {
+                llama_hprof_record("srv.spec_draft", hp_t0);
+            }
         }
 
         // make checkpoints if needed
@@ -3715,12 +3747,24 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool hp_on = llama_hprof_enabled() && batch_view.n_tokens <= 16;
+        int64_t hp_t0 = hp_on ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            if (hp_on) {
+                llama_hprof_record("srv.tgt_llama_decode", hp_t0);
+            }
             if (ret == 0 && has_output) {
+                const int64_t hp_t1 = hp_on ? ggml_time_us() : 0;
                 llama_synchronize(ctx_tgt);
+                if (hp_on) {
+                    llama_hprof_record("srv.tgt_synchronize", hp_t1);
+                }
             }
         });
+        if (hp_on) {
+            llama_hprof_record("srv.tgt_decode+sync(yield)", hp_t0);
+        }
 
         if (ret != 0) {
             {
@@ -3780,9 +3824,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            hp_t0 = hp_on ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            if (hp_on) {
+                llama_hprof_record("srv.spec_process", hp_t0);
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3957,6 +4005,8 @@ private:
                                             slot.spec_draft_q.size() == slot.spec_draft.size());
 
                 std::vector<llama_token> accepted;
+                const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+                struct hp_rec { int64_t t0; ~hp_rec() { if (t0) llama_hprof_record("srv.sample_accept", t0); } } hp_r { hp_t0 };
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(

@@ -156,6 +156,16 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+
+            // [step-proto] the chain's first effective sampler is top_k(k): select the k best logits in one
+            // pass instead of materialising n_vocab token_data and partial-sorting them (same set, same order)
+            const int32_t k = fast_top_k();
+            if (k > 0 && k < n_vocab) {
+                select_top_k(logits, n_vocab, k);
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
+
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -163,6 +173,68 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // env LLAMA_SAMPLER_FAST_TOPK=1: returns top_k when everything the chain runs before top-k is a no-op
+    // (no logit bias / suppress list, neutral penalties, DRY and top-n-sigma off) and no grammar or reasoning
+    // budget sees the full vocab; 0 otherwise
+    int32_t fast_top_k() const {
+        static const bool enabled = getenv("LLAMA_SAMPLER_FAST_TOPK") && atoi(getenv("LLAMA_SAMPLER_FAST_TOPK")) != 0;
+        if (!enabled || grmr || rbudget || params.mirostat != 0 || params.top_k <= 0) {
+            return 0;
+        }
+        const int n = llama_sampler_chain_n(chain);
+        for (int i = 0; i < n; ++i) {
+            const std::string name = llama_sampler_name(llama_sampler_chain_get(chain, i));
+            if (name == "top-k") {
+                return params.top_k;
+            }
+            const bool noop =
+                (name == "penalties"   && (params.penalty_last_n == 0 || (params.penalty_repeat == 1.0f &&
+                                           params.penalty_freq == 0.0f && params.penalty_present == 0.0f))) ||
+                (name == "dry"         && (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0)) ||
+                (name == "top-n-sigma" && params.top_n_sigma <= 0.0f);
+            if (!noop) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    // k largest logits, sorted by logit descending (ties: lower id first), into cur
+    void select_top_k(const float * logits, int n_vocab, int k) {
+        auto better = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+        };
+        cur.resize(k);
+        for (int i = 0; i < k; ++i) {
+            cur[i] = llama_token_data{i, logits[i], 0.0f};
+        }
+        // min-heap on "better": cur[0] is the worst of the kept k
+        std::make_heap(cur.begin(), cur.end(), better);
+        float thr = cur[0].logit;
+        // blocks of 64: a vectorisable max skips every block that cannot beat the current k-th best
+        constexpr int B = 64;
+        for (int i = k, end; i < n_vocab; i = end) {
+            end = std::min(n_vocab, (i / B + 1) * B);
+            float m = logits[i];
+            for (int j = i + 1; j < end; ++j) {
+                m = std::max(m, logits[j]);
+            }
+            if (!(m > thr)) {
+                continue;
+            }
+            for (int j = i; j < end; ++j) {
+                const float l = logits[j];
+                if (l > thr) { // an equal logit has a higher id than every kept tie, so it never wins
+                    std::pop_heap(cur.begin(), cur.end(), better);
+                    cur.back() = llama_token_data{j, l, 0.0f};
+                    std::push_heap(cur.begin(), cur.end(), better);
+                    thr = cur[0].logit;
+                }
+            }
+        }
+        std::sort(cur.begin(), cur.end(), better);
     }
 
     common_time_meas tm() {

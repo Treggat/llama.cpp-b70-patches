@@ -442,6 +442,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     }
 }
 catch (const std::exception & e) {
+    if (g_ggml_sycl_graph_recording) {
+        // oneDNN SDPA cannot be recorded into a SYCL command graph (it depends on events from outside
+        // the graph): give the whole ggml graph back to the recorder, which runs it eagerly with oneDNN
+        throw;
+    }
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
     GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
     ggml_sycl_flash_attn_ext_tile(ctx, dst);

@@ -13,10 +13,16 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -134,12 +140,21 @@ static void crash() {
   *ptr = 0;
 }
 
+// true while the SYCL backend records a command graph (GGML_SYCL_ENABLE_GRAPH=1): errors raised by an op
+// (typically a host wait, which a recording queue rejects) are then thrown back to the recorder, which
+// discards the recording and runs that graph eagerly, instead of aborting the process
+extern bool g_ggml_sycl_graph_recording;
+
 [[noreturn]] static void ggml_sycl_error(
     const char* stmt,
     const char* func,
     const char* file,
     const int line,
     const char* msg) {
+  if (g_ggml_sycl_graph_recording) {
+    fprintf(stderr, "SYCL error while recording a graph: %s in function %s at %s:%d\n", stmt, func, file, line);
+    throw std::runtime_error("SYCL error while recording a graph");
+  }
   fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
   fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
   GGML_ABORT("SYCL error");
@@ -329,6 +344,11 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
                                ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
 void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 
+// Bumped on every runtime free of device memory (buffers, pools, FA scratch). The SYCL command-graph
+// cache (GGML_SYCL_ENABLE_GRAPH=1) drops every recorded graph when it changes, so a replayed graph can
+// never point at freed memory.
+extern std::atomic<uint64_t> g_ggml_sycl_mem_epoch;
+
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
 struct mmid_row_mapping {
@@ -446,6 +466,20 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+
+    // Keyed executable-graph cache (GGML_SYCL_ENABLE_GRAPH=1, GGML_SYCL_GRAPH_CACHE=1 default).
+    // Key = exact signature of the ggml graph (every node's op, type, shape, strides, data pointer,
+    // op_params and every src's type, shape, strides, data pointer and reorder state).
+    struct graph_cache_entry {
+        std::vector<uint64_t> sig;
+        int      seen     = 0;      // eager runs so far
+        bool     no_graph = false;  // recording failed once: always run eagerly
+        uint64_t last_use = 0;
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec;
+    };
+    std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
+    uint64_t graph_cache_epoch = 0;
+    uint64_t graph_cache_tick  = 0;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

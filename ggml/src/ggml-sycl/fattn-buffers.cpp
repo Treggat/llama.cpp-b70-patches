@@ -20,6 +20,7 @@ sycl::half * ggml_sycl_fattn_kv_buffers::kv_buffer::ensure_half(size_t n_elems) 
     }
 
     if (ptr) {
+        g_ggml_sycl_mem_epoch.fetch_add(1, std::memory_order_relaxed);
         SYCL_CHECK(CHECK_TRY_ERROR(qptr->wait()));
         ggml_sycl_memtrace_del(ptr);
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
@@ -54,6 +55,7 @@ ggml_sycl_fattn_kv_buffers::kv_buffer::~kv_buffer() {
     GGML_LOG_INFO("ggml_sycl_fattn_kv_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
 #endif
     if (ptr) {
+        g_ggml_sycl_mem_epoch.fetch_add(1, std::memory_order_relaxed);
         ggml_sycl_memtrace_del(ptr);
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
     }

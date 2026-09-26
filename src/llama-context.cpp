@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -764,12 +765,44 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// ---- env-gated host-phase profiler: LLAMA_HOST_PROF=N prints cumulative per-key wall times every N decodes ----
+struct llama_hprof_acc { int64_t n = 0; double ms = 0; };
+static std::map<std::string, llama_hprof_acc> g_llama_hprof;
+static int64_t g_llama_hprof_decodes = 0;
+static void llama_hprof_print() {
+    for (auto & kv : g_llama_hprof) {
+        fprintf(stderr, "[host-prof] %-28s n=%8lld avg=%8.3f ms total=%10.1f ms\n", kv.first.c_str(),
+                (long long) kv.second.n, kv.second.n ? kv.second.ms / kv.second.n : 0.0, kv.second.ms);
+    }
+    fflush(stderr);
+}
+static int llama_hprof_mode() {
+    static int every = -1;
+    if (every < 0) {
+        const char * e = getenv("LLAMA_HOST_PROF");
+        every = e ? std::max(0, atoi(e)) : 0;
+        if (every > 0) std::atexit(llama_hprof_print);
+    }
+    return every;
+}
+static void llama_hprof_add(const std::string & key, int64_t t0_us) {
+    auto & a = g_llama_hprof[key];
+    a.n++;
+    a.ms += (ggml_time_us() - t0_us) / 1000.0;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        const int64_t t0 = llama_hprof_mode() > 0 ? ggml_time_us() : 0;
+        ggml_backend_sched_synchronize(sched.get());
+        if (t0 && n_queued_tokens > 0) {
+            llama_hprof_add(std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".sync_wait", t0);
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1395,6 +1428,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    const bool hprof = llama_hprof_mode() > 0;
+    const std::string hp_tag = std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".n" + std::to_string(ubatch.n_tokens);
+    int64_t hp_t0 = hprof ? ggml_time_us() : 0;
+    bool hp_reused = false;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1403,6 +1441,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        hp_reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1446,12 +1485,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (hprof) {
+            llama_hprof_add(hp_tag + (hp_reused ? ".build_reuse" : ".build_alloc"), hp_t0);
+            hp_t0 = ggml_time_us();
+        }
+
         res->set_inputs(&ubatch);
 
+        if (hprof) {
+            llama_hprof_add(hp_tag + ".set_inputs", hp_t0);
+            hp_t0 = ggml_time_us();
+        }
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (hprof) {
+        llama_hprof_add(hp_tag + ".graph_compute", hp_t0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4323,10 +4374,40 @@ int32_t llama_encode(
     return ret;
 }
 
+// exported hook so common/ and tools/ can record phases into the same LLAMA_HOST_PROF table
+bool llama_hprof_enabled(void) {
+    return llama_hprof_mode() > 0;
+}
+
+void llama_hprof_record(const char * key, int64_t t0_us) {
+    if (llama_hprof_mode() > 0) {
+        llama_hprof_add(key, t0_us);
+    }
+}
+
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    const int hp_every = llama_hprof_mode();
+    if (hp_every > 0) {
+        // a prefill-size batch after decode-size batches starts a new phase: print and reset the table
+        static bool have_small = false;
+        if (batch.n_tokens > 16 && have_small) {
+            llama_hprof_print();
+            fprintf(stderr, "[host-prof] ---- reset ----\n");
+            g_llama_hprof.clear();
+            have_small = false;
+        }
+        if (batch.n_tokens <= 16) have_small = true;
+    }
+    const int64_t hp_t0 = hp_every > 0 ? ggml_time_us() : 0;
     const int ret = ctx->decode(batch);
+    if (hp_every > 0) {
+        llama_hprof_add(std::string(ctx->get_cparams().embeddings_nextn_masked ? "dft" : "tgt") + ".llama_decode_call", hp_t0);
+        if (++g_llama_hprof_decodes % hp_every == 0) {
+            llama_hprof_print();
+        }
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

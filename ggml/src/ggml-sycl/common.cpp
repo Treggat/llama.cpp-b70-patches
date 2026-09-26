@@ -133,8 +133,12 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
     return ptr;
 }
 
+std::atomic<uint64_t> g_ggml_sycl_mem_epoch{0};
+bool g_ggml_sycl_graph_recording = false;
+
 void ggml_sycl_free_device(void *ptr, sycl::queue &q) {
     if (!ptr) return;
+    g_ggml_sycl_mem_epoch.fetch_add(1, std::memory_order_relaxed);
     ggml_sycl_memtrace_del(ptr);
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
     if (ggml_sycl_use_level_zero_device_alloc(q)) {

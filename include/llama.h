@@ -999,6 +999,10 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // [step-prof] env LLAMA_HOST_PROF=N: record wall time since t0_us (ggml_time_us) under key
+    LLAMA_API bool llama_hprof_enabled(void);
+    LLAMA_API void llama_hprof_record(const char * key, int64_t t0_us);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

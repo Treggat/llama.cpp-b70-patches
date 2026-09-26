@@ -1613,6 +1613,7 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     if (buffer->context == nullptr) {
         return;
     }
+    g_ggml_sycl_mem_epoch.fetch_add(1, std::memory_order_relaxed);
     if (g_ggml_sycl_enable_host_pinned_mem) {
         const int device = ggml_backend_sycl_host_buffer_type_device(buffer->buft);
         auto & q = dpct::dev_mgr::instance().get_device(device).default_queue();
@@ -5905,6 +5906,11 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
 
     return true;
 } catch (sycl::exception & e) {
+    if (g_ggml_sycl_graph_recording) {
+        // an op that cannot be recorded (e.g. a host wait): let the graph recorder fall back to eager execution
+        std::cerr << "[SYCL-GRAPH] op " << ggml_op_name(dst->op) << " (" << dst->name << ") cannot be recorded: " << e.what() << std::endl;
+        throw;
+    }
     std::cerr << e.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::cerr << "Error OP "<<ggml_op_name(dst->op)<< std::endl;
     std::exit(1);
@@ -6359,11 +6365,16 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
+            // GGML_OP_CONCAT used to be listed here for a blocking host wait after its dim-3 memcpys.
+            // That wait was removed in d415e65a5 (concat.cpp now only enqueues kernels / D2D memcpys),
+            // so CONCAT is graph-safe and no longer blocks graphs (needed by the qwen35 conv state and MTP).
+            case GGML_OP_SET_ROWS:
+                // K-quant / IQ destinations are quantized on the host (set_rows.cpp: memcpy + wait);
+                // the device kernels (f32/f16/bf16/q8_0/q4_x/q5_x/iq4_nl/mxfp4/nvfp4/q1_0/q2_0) are fine
+                if (ggml_is_quantized(cgraph->nodes[i]->type) && ggml_blck_size(cgraph->nodes[i]->type) == QK_K) {
+                    return false;
+                }
+                break;
             case GGML_OP_MUL_MAT_ID:
                 // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
                 // submitting a memcpy operation, but wait() can't be called on a queue that
@@ -6389,7 +6400,392 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
+// ---- env-gated per-graph wall timer: GGML_SYCL_GRAPH_TIME=N. Waits for the queue before (pre) and after
+//      (total) each graph_compute; "submit" is the host time spent enqueueing. Prints every N graphs. ----
+struct ggml_sycl_gtime_acc { int64_t n = 0; double pre = 0, submit = 0, total = 0; };
+static std::map<std::pair<int, int64_t>, ggml_sycl_gtime_acc> g_sycl_gtime;
+static int64_t g_sycl_gtime_count = 0;
+static void ggml_sycl_gtime_print() {
+    for (auto & kv : g_sycl_gtime) {
+        const auto & a = kv.second;
+        if (a.n == 0) continue;
+        fprintf(stderr, "[sycl-gtime] n_nodes=%5d n_tokens=%5lld graphs=%7lld pre=%.3f submit=%.3f total=%.3f ms/graph\n",
+                kv.first.first, (long long) kv.first.second, (long long) a.n, a.pre / a.n, a.submit / a.n, a.total / a.n);
+    }
+    fflush(stderr);
+}
+static int ggml_sycl_gtime_mode() {
+    static int every = -1;
+    if (every < 0) {
+        const char * e = getenv("GGML_SYCL_GRAPH_TIME");
+        every = e ? std::max(0, atoi(e)) : 0;
+        if (every > 0) std::atexit(ggml_sycl_gtime_print);
+    }
+    return every;
+}
+
+static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    const int every = ggml_sycl_gtime_mode();
+    if (every <= 0) {
+        return ggml_backend_sycl_graph_compute_timed(backend, cgraph);
+    }
+    auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    int64_t n_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    sycl_ctx->stream()->wait();
+    const auto t1 = std::chrono::steady_clock::now();
+    const ggml_status st = ggml_backend_sycl_graph_compute_timed(backend, cgraph);
+    const auto t2 = std::chrono::steady_clock::now();
+    sycl_ctx->stream()->wait();
+    const auto t3 = std::chrono::steady_clock::now();
+    // a prefill-size graph after decode-size graphs starts a new phase: print and reset the table
+    static bool have_small = false;
+    if (n_tokens > 16 && have_small) {
+        ggml_sycl_gtime_print();
+        fprintf(stderr, "[sycl-gtime] ---- reset ----\n");
+        g_sycl_gtime.clear();
+        have_small = false;
+    }
+    if (n_tokens <= 16) have_small = true;
+    auto & a = g_sycl_gtime[std::make_pair(cgraph->n_nodes, n_tokens)];
+    a.n++;
+    a.pre    += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    a.submit += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    a.total  += std::chrono::duration<double, std::milli>(t3 - t1).count();
+    if (++g_sycl_gtime_count % every == 0) ggml_sycl_gtime_print();
+    return st;
+}
+
+#ifdef GGML_SYCL_GRAPH
+// ---- keyed SYCL command-graph cache (only active with GGML_SYCL_ENABLE_GRAPH=1) ----
+// Upstream records a fresh command graph on EVERY graph_compute and then updates one executable graph,
+// which (a) still pays the full per-kernel host submission cost while recording and (b) fails the update
+// (-> full finalize) whenever consecutive graphs differ, e.g. MTP draft vs verify vs catch-up.
+// Here every distinct ggml graph (exact 128-bit signature over all nodes and srcs) gets its own executable
+// graph: the first GGML_SYCL_GRAPH_WARMUP calls run eagerly (one-time weight reorders, pool growth and FA
+// scratch growth happen there, outside any recording), the next call records + finalizes, and every later
+// call with the same signature is a single ext_oneapi_graph() replay with no per-kernel host work.
+// Any runtime free of device memory bumps g_ggml_sycl_mem_epoch and drops every cached graph.
+//   GGML_SYCL_GRAPH_CACHE=1       keyed cache (default); 0 = upstream record+update every call
+//   GGML_SYCL_GRAPH_WARMUP=1      eager runs of a new signature before it is recorded
+//   GGML_SYCL_GRAPH_CACHE_MAX=64  executable graphs kept per context (LRU)
+//   GGML_SYCL_GRAPH_MIN_NODES=0   graphs with fewer nodes always run eagerly
+//   GGML_SYCL_GRAPH_MAX_TOKENS=32 graphs whose MUL_MAT / FLASH_ATTN_EXT see more rows (prefill ubatches,
+//                                 vision encoder) always run eagerly: they are GPU-bound, and it keeps
+//                                 graph recording to the decode / draft / verify graphs the tests cover
+//   GGML_SYCL_GRAPH_STATS=N       print counters every N graph_compute calls and at exit (0 = off)
+//   GGML_SYCL_GRAPH_SELFTEST=1    test hook: eager run, poison node outputs with 0xFF, record, replay
+//                                 (so test-backend-ops compares the REPLAYED result against the CPU);
+//                                 =2 is the harness's negative control (records but never replays)
+using ggml_sycl_exec_graph_t = sycl_ex::command_graph<sycl_ex::graph_state::executable>;
+
+struct ggml_sycl_graph_cfg {
+    int cache     = 1;
+    int warmup    = 1;
+    int max       = 64;
+    int min_nodes = 0;
+    int max_tokens = 32;
+    int stats     = 0;
+    int selftest  = 0;
+};
+
+static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
+    static const ggml_sycl_graph_cfg cfg = [] {
+        ggml_sycl_graph_cfg c;
+        c.cache     = ggml_sycl_get_env("GGML_SYCL_GRAPH_CACHE", 1);
+        c.warmup    = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_WARMUP", 1));
+        c.max       = std::max(1, ggml_sycl_get_env("GGML_SYCL_GRAPH_CACHE_MAX", 64));
+        c.min_nodes = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_MIN_NODES", 0));
+        c.max_tokens = std::max(1, ggml_sycl_get_env("GGML_SYCL_GRAPH_MAX_TOKENS", 32));
+        c.stats     = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_STATS", 0));
+        c.selftest  = ggml_sycl_get_env("GGML_SYCL_GRAPH_SELFTEST", 0);
+        if (g_ggml_sycl_enable_graph) {
+            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d\n",
+                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+struct ggml_sycl_gsig {
+    uint64_t h1 = 0x9E3779B97F4A7C15ull;
+    uint64_t h2 = 0xC2B2AE3D27D4EB4Full;
+    // two independent multiplicative streams (one multiply each per word; ~2 ns/word on the host)
+    inline void add(uint64_t v) {
+        h1 = (((h1 << 23) | (h1 >> 41)) ^ v) * 0x9E3779B97F4A7C15ull;
+        h2 = (h2 + v) * 0xD6E8FEB86659FD93ull;
+        h2 ^= h2 >> 32;
+    }
+    inline void tensor(const ggml_tensor * t) {
+        add((uint64_t) (uintptr_t) t->data);
+        uint64_t ex = 0;
+        if (t->extra && t->buffer && ggml_backend_buffer_is_sycl(t->buffer)) {
+            const auto * e = static_cast<const ggml_tensor_extra_gpu *>(t->extra);
+            ex = (e->optimized_feature.reorder ? 1u : 0u) | (e->optimized_feature.dnn_u4 ? 2u : 0u) | 4u;
+        }
+        add(((uint64_t) t->type << 40) | ((uint64_t) t->op << 8) | ex);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            add((uint64_t) t->ne[d]);
+            add((uint64_t) t->nb[d]);
+        }
+    }
+};
+
+static void ggml_sycl_graph_signature(const ggml_cgraph * cgraph, uint64_t & h1, uint64_t & h2) {
+    ggml_sycl_gsig s;
+    s.add((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        s.tensor(node);
+        s.add((uint64_t) (uint32_t) node->flags);
+        for (size_t k = 0; k < GGML_MAX_OP_PARAMS / sizeof(uint64_t); k++) {
+            uint64_t w;
+            memcpy(&w, (const char *) node->op_params + k * sizeof(uint64_t), sizeof(w));
+            s.add(w);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                s.tensor(node->src[j]);
+            } else {
+                s.add(0xFFFFull + j);
+            }
+        }
+    }
+    h1 = s.h1;
+    h2 = s.h2;
+}
+
+// process-wide counters (all contexts), printed with GGML_SYCL_GRAPH_STATS=N
+static uint64_t g_gstat_replay = 0, g_gstat_record = 0, g_gstat_eager = 0, g_gstat_fail = 0, g_gstat_flush = 0,
+                g_gstat_evict = 0, g_gstat_selftest_skip = 0;
+static double   g_gstat_sig_us = 0;
+
+static void ggml_sycl_graph_stats_print() {
+    const uint64_t n = g_gstat_replay + g_gstat_record + g_gstat_eager;
+    fprintf(stderr, "[SYCL-GRAPH] calls=%llu replay=%llu record=%llu eager=%llu fail=%llu flush=%llu evict=%llu selftest_inplace_skip=%llu sig=%.1f us/call\n",
+                  (unsigned long long) n, (unsigned long long) g_gstat_replay, (unsigned long long) g_gstat_record,
+                  (unsigned long long) g_gstat_eager, (unsigned long long) g_gstat_fail,
+                  (unsigned long long) g_gstat_flush, (unsigned long long) g_gstat_evict,
+                  (unsigned long long) g_gstat_selftest_skip, n ? g_gstat_sig_us / n : 0.0);
+}
+
+// drop every executable graph (waits for the queue first if any of them may still be in flight)
+static void ggml_sycl_graph_cache_flush(ggml_backend_sycl_context * ctx) {
+    bool any_exec = false;
+    for (auto & kv : ctx->graph_cache) {
+        any_exec |= (bool) kv.second.exec;
+    }
+    if (any_exec) {
+        ctx->stream()->wait();
+        g_gstat_flush++;
+    }
+    ctx->graph_cache.clear();
+}
+
+static void ggml_sycl_graph_cache_evict(ggml_backend_sycl_context * ctx, size_t max) {
+    while (ctx->graph_cache.size() > max) {
+        auto victim = ctx->graph_cache.begin();
+        for (auto it = ctx->graph_cache.begin(); it != ctx->graph_cache.end(); ++it) {
+            if (it->second.last_use < victim->second.last_use) {
+                victim = it;
+            }
+        }
+        if (victim->second.exec) {
+            ctx->stream()->wait();
+        }
+        ctx->graph_cache.erase(victim);
+        g_gstat_evict++;
+    }
+}
+
+// selftest only: overwrite every non-view, non-input node output with 0xFF (NaN for f32/f16) so a replay
+// that silently did nothing cannot pass test-backend-ops
+static bool ggml_sycl_node_aliases_src(const ggml_tensor * node) {
+    const char * d0 = (const char *) node->data;
+    const char * d1 = d0 + ggml_nbytes(node);
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * s = node->src[j];
+        // write-only destinations: CPY src[1] and SET_ROWS src[2] are the tensor being written, never read
+        if ((node->op == GGML_OP_CPY && j == 1) || (node->op == GGML_OP_SET_ROWS && j == 2)) {
+            continue;
+        }
+        if (s && s->data) {
+            const char * s0 = (const char *) s->data;
+            const char * s1 = s0 + ggml_nbytes(s);
+            if (s0 < d1 && d0 < s1) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// returns false (and poisons nothing) when the graph has a true in-place node (output overlaps one of its
+// own srcs, e.g. add_inplace / rope inplace): running such a graph twice is not idempotent, so the selftest
+// cannot compare a replay against the CPU for it and keeps the eager result
+static bool ggml_sycl_graph_poison_outputs(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->data && !ggml_op_is_empty(node->op) && ggml_sycl_node_aliases_src(node)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        // a CPY into a view overwrites its whole destination, so it can be poisoned too
+        // (SET_ROWS only writes some rows of its destination: not poisoned, compared as written)
+        if ((node->view_src && !(node->op == GGML_OP_CPY && ggml_is_contiguous(node))) || !node->data || !node->buffer || !ggml_backend_buffer_is_sycl(node->buffer) ||
+            (node->flags & GGML_TENSOR_FLAG_INPUT) || ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        ctx->stream()->memset(node->data, 0xFF, ggml_nbytes(node));
+    }
+    return true;
+}
+
+// record + finalize; returns nullptr (after running nothing) if recording is not possible
+static std::unique_ptr<ggml_sycl_exec_graph_t> ggml_sycl_graph_record(ggml_backend_sycl_context * ctx,
+                                                                      ggml_cgraph * cgraph) {
+    const uint64_t epoch0 = g_ggml_sycl_mem_epoch.load(std::memory_order_relaxed);
+    sycl::queue & q = *(ctx->stream());
+    sycl_ex::command_graph<sycl_ex::graph_state::modifiable> g(q, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+    bool recording = false;
+    try {
+        g.begin_recording(q);
+        recording = true;
+        g_ggml_sycl_graph_recording = true;
+        ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        g_ggml_sycl_graph_recording = false;
+        recording = false;
+        g.end_recording();
+    } catch (std::exception const & e) {
+        g_ggml_sycl_graph_recording = false;
+        if (recording) {
+            try { g.end_recording(); } catch (...) {}
+        }
+        GGML_LOG_WARN("[SYCL-GRAPH] recording failed (%s), graph with %d nodes runs eagerly\n", e.what(), cgraph->n_nodes);
+        return nullptr;
+    }
+    if (g_ggml_sycl_mem_epoch.load(std::memory_order_relaxed) != epoch0) {
+        GGML_LOG_WARN("[SYCL-GRAPH] device memory freed while recording, graph with %d nodes runs eagerly\n", cgraph->n_nodes);
+        return nullptr;
+    }
+    try {
+        return std::make_unique<ggml_sycl_exec_graph_t>(g.finalize());
+    } catch (std::exception const & e) {
+        GGML_LOG_WARN("[SYCL-GRAPH] finalize failed (%s), graph with %d nodes runs eagerly\n", e.what(), cgraph->n_nodes);
+        return nullptr;
+    }
+}
+
+static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
+    const ggml_sycl_graph_cfg & cfg = ggml_sycl_graph_config();
+
+    static bool stats_registered = false;
+    if (cfg.stats > 0 && !stats_registered) {
+        stats_registered = true;
+        std::atexit(ggml_sycl_graph_stats_print);
+    }
+    const uint64_t calls = g_gstat_replay + g_gstat_record + g_gstat_eager + 1;
+    if (cfg.stats > 0 && calls % (uint64_t) cfg.stats == 0) {
+        ggml_sycl_graph_stats_print();
+    }
+
+    bool too_big = cgraph->n_nodes < cfg.min_nodes;
+    for (int i = 0; i < cgraph->n_nodes && !too_big; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1]) {
+            too_big = node->src[1]->ne[1] > cfg.max_tokens;
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            too_big = node->src[0]->ne[1] > cfg.max_tokens;
+        }
+    }
+    if (too_big) {
+        g_gstat_eager++;
+        ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        return;
+    }
+
+    const uint64_t epoch = g_ggml_sycl_mem_epoch.load(std::memory_order_relaxed);
+    if (epoch != ctx->graph_cache_epoch) {
+        ggml_sycl_graph_cache_flush(ctx);
+        ctx->graph_cache_epoch = epoch;
+    }
+
+    uint64_t h1, h2;
+    if (cfg.stats > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_sycl_graph_signature(cgraph, h1, h2);
+        g_gstat_sig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    } else {
+        ggml_sycl_graph_signature(cgraph, h1, h2);
+    }
+
+    auto it = ctx->graph_cache.find(h1);
+    if (it != ctx->graph_cache.end() && (it->second.sig.size() != 2 || it->second.sig[0] != h2 ||
+                                          it->second.sig[1] != (uint64_t) cgraph->n_nodes)) {
+        // 64-bit key collision with a different graph: forget the old one
+        if (it->second.exec) {
+            ctx->stream()->wait();
+        }
+        ctx->graph_cache.erase(it);
+        it = ctx->graph_cache.end();
+    }
+    if (it == ctx->graph_cache.end()) {
+        it = ctx->graph_cache.emplace(h1, ggml_backend_sycl_context::graph_cache_entry{}).first;
+        it->second.sig = { h2, (uint64_t) cgraph->n_nodes };
+    }
+    auto & e = it->second;
+    e.last_use = ++ctx->graph_cache_tick;
+
+    if (e.exec) {
+        g_gstat_replay++;
+        ctx->stream()->ext_oneapi_graph(*e.exec);
+        return;
+    }
+
+    if (e.no_graph || e.seen < cfg.warmup) {
+        e.seen++;
+        g_gstat_eager++;
+        ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        if (cfg.selftest && !e.no_graph) {
+            if (!ggml_sycl_graph_poison_outputs(ctx, cgraph)) {
+                g_gstat_selftest_skip++;
+                return;
+            }
+            // fall through: record + replay the same graph now
+        } else {
+            ggml_sycl_graph_cache_evict(ctx, (size_t) cfg.max);
+            return;
+        }
+    }
+
+    auto exec = ggml_sycl_graph_record(ctx, cgraph);
+    if (!exec) {
+        g_gstat_fail++;
+        e.no_graph = true;
+        g_gstat_eager++;
+        ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        ggml_sycl_graph_cache_evict(ctx, (size_t) cfg.max);
+        return;
+    }
+    g_gstat_record++;
+    e.exec = std::move(exec);
+    if (cfg.selftest == 2) {
+        return;  // negative control for the selftest harness: poisoned outputs are NOT recomputed -> tests must fail
+    }
+    ctx->stream()->ext_oneapi_graph(*e.exec);
+    ggml_sycl_graph_cache_evict(ctx, (size_t) cfg.max);
+}
+#endif
+
+static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
@@ -6402,6 +6798,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         if (!graph_support) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] can not use graphs on device:%d\n", sycl_ctx->device);
             ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        if (ggml_sycl_graph_config().cache) {
+            ggml_sycl_graph_compute_cached(sycl_ctx, cgraph);
             return GGML_STATUS_SUCCESS;
         }
 

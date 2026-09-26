@@ -335,8 +335,140 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+// [step-prof] the seat's target sampler per verify row: set_logits (copy 248320 raw logits into token_data)
+// + chain penalties(neutral) top_k(20) top_p(0.95) min_p(0.05) temp(1.0) dist, as common_sampler builds it
+static void test_perf_house() {
+    const int n_vocab = 248320;
+    std::vector<float> logits(n_vocab);
+    for (int i = 0; i < n_vocab; i++) {
+        logits[i] = 8.0f*((double)(rand())/RAND_MAX - 0.5);
+    }
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.0f, 0.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(1.0f));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(42));
+    std::vector<llama_token_data> cur(n_vocab);
+    const int n_iter = 300;
+    double t_fill = 0, t_chain = 0;
+    for (int it = 0; it < n_iter + 10; it++) {
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < n_vocab; i++) {
+            cur[i] = llama_token_data{i, logits[(i + it) % n_vocab], 0.0f};
+        }
+        const int64_t t1 = ggml_time_us();
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(chain, &cur_p);
+        const int64_t t2 = ggml_time_us();
+        if (it >= 10) { t_fill += t1 - t0; t_chain += t2 - t1; }
+    }
+    llama_sampler_free(chain);
+    printf("HOUSE target row: set_logits fill %.1f us, chain(k20,p.95,m.05,t1,dist) %.1f us, total %.1f us/row\n",
+           t_fill / n_iter, t_chain / n_iter, (t_fill + t_chain) / n_iter);
+
+    // the draft CPU fallback: top_k(10) only
+    llama_sampler * c2 = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(c2, llama_sampler_init_top_k(10));
+    int64_t t_c2 = 0;
+    for (int it = 0; it < n_iter; it++) {
+        for (int i = 0; i < n_vocab; i++) {
+            cur[i] = llama_token_data{i, logits[(i + it) % n_vocab], 0.0f};
+        }
+        const int64_t t1 = ggml_time_us();
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(c2, &cur_p);
+        t_c2 += ggml_time_us() - t1;
+    }
+    llama_sampler_free(c2);
+    printf("HOUSE draft cpu top_k(10): %.1f us/row\n", (double) t_c2 / n_iter);
+
+    // fast top-k prefilter (the common/sampling.cpp prototype's select_top_k) vs the full path:
+    // same post-chain candidates and the same sampled token for the same seed, and the time per row
+    auto better = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    };
+    auto make_chain = []() {
+        llama_sampler * c = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(c, llama_sampler_init_penalties(248320, 64, 1.0f, 0.0f, 0.0f));
+        llama_sampler_chain_add(c, llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(c, llama_sampler_init_top_p(0.95f, 1));
+        llama_sampler_chain_add(c, llama_sampler_init_min_p(0.05f, 1));
+        llama_sampler_chain_add(c, llama_sampler_init_temp(1.0f));
+        llama_sampler_chain_add(c, llama_sampler_init_dist(1234));
+        return c;
+    };
+    llama_sampler * ca = make_chain();
+    llama_sampler * cb = make_chain();
+    std::vector<llama_token_data> fast;
+    int64_t ta = 0, tb = 0;
+    int n_mismatch = 0;
+    const int n_rows = 2000;
+    for (int it = 0; it < n_rows; it++) {
+        // peaked rows like a real LM head: a few large logits over a noise floor
+        for (int i = 0; i < n_vocab; i++) {
+            logits[i] = 4.0f*((double)(rand())/RAND_MAX - 0.5);
+        }
+        for (int j = 0; j < 8; j++) {
+            logits[rand() % n_vocab] = 10.0f + 6.0f*((double)(rand())/RAND_MAX);
+        }
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < n_vocab; i++) {
+            cur[i] = llama_token_data{i, logits[i], 0.0f};
+        }
+        llama_token_data_array pa = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(ca, &pa);
+        const int64_t t1 = ggml_time_us();
+        const int k = 20;
+        fast.resize(k);
+        for (int i = 0; i < k; ++i) fast[i] = llama_token_data{i, logits[i], 0.0f};
+        std::make_heap(fast.begin(), fast.end(), better);
+        float thr = fast[0].logit;
+        constexpr int B = 64;
+        for (int i = k, end; i < n_vocab; i = end) {
+            end = std::min(n_vocab, (i / B + 1) * B);
+            float m = logits[i];
+            for (int j = i + 1; j < end; ++j) {
+                m = std::max(m, logits[j]);
+            }
+            if (!(m > thr)) {
+                continue;
+            }
+            for (int j = i; j < end; ++j) {
+                const float l = logits[j];
+                if (l > thr) {
+                    std::pop_heap(fast.begin(), fast.end(), better);
+                    fast.back() = llama_token_data{j, l, 0.0f};
+                    std::push_heap(fast.begin(), fast.end(), better);
+                    thr = fast[0].logit;
+                }
+            }
+        }
+        std::sort(fast.begin(), fast.end(), better);
+        llama_token_data_array pb = { fast.data(), fast.size(), -1, true };
+        llama_sampler_apply(cb, &pb);
+        const int64_t t2 = ggml_time_us();
+        ta += t1 - t0; tb += t2 - t1;
+        bool same = pa.size == pb.size && pa.data[pa.selected].id == pb.data[pb.selected].id;
+        for (size_t j = 0; same && j < pa.size; ++j) {
+            same = pa.data[j].id == pb.data[j].id && pa.data[j].p == pb.data[j].p;
+        }
+        n_mismatch += !same;
+    }
+    llama_sampler_free(ca);
+    llama_sampler_free(cb);
+    printf("HOUSE fast-topk check: %d rows, %d mismatches (candidates, probs, sampled id); full %.1f us/row, fast %.1f us/row\n",
+           n_rows, n_mismatch, (double) ta / n_rows, (double) tb / n_rows);
+}
+
 int main(void) {
     ggml_time_init();
+
+    if (getenv("HOUSE_ONLY")) {
+        test_perf_house();
+        return 0;
+    }
 
     test_dist_singleton_rng();
 

@@ -11184,6 +11184,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // [step-prof] house model: q8_0 LM head (248320), q8_0 MTP draft head (98304), q8_0 MTP layer shapes,
+    // GDN (16 k-heads x3 v-repeat, d128, K rollback slots), ssm_conv, rms_norm, top-k over the padded vocab
+    for (int nc : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
+        // remaining house q4_K shapes: ssm_alpha/ssm_beta (48 rows), ssm_out/attn_output (k=6144), attn_q (12288)
+        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {48, 5120}, {5120, 6144}, {12288, 5120} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int nc : { 1, 2, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 98304, nc, 5120, { 1, 1 }, { 1, 1 }));
+        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {12288, 5120}, {1024, 5120}, {5120, 6144}, {5120, 10240} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int nt : { 1, 2, 4, 6, 8 }) {
+        for (int64_t K : { 1, 8 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, K));
+        }
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + nt, 10240, 1, 1}, {4, 10240, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + nt, 10240, 1, 1}, {4, 10240, 1, 1}, false));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {5120, nt, 1, 1}, 1e-6f));
+        test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {5120, nt, 1, 1}, {1, 1, 1, 1}));
+    }
+    for (int k : { 10, 20 }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
+    }
+    test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248320, 1, 1, 1}));
+
     // LOCAL (not for upstream): model-shape q4_K matmuls at verify column counts (SYCL oneDNN u4 path vs MMVQ)
     // (1024x5120: small-weight check for the XMX column window, as for q6_K below)
     for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {1024, 5120} }) {
