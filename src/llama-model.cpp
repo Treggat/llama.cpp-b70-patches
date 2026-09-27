@@ -2734,7 +2734,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
+                        uint32_t       kv_size  = cparams.n_ctx_seq;
+                        uint32_t       n_swa    = hparams.n_swa;
+                        llama_swa_type swa_type = hparams.swa_type;
+                        uint32_t       n_sink   = 0;
+
+                        // [spechost] LLAMA_MTP_DRAFT_SWA=N (default 0 = off): the dense MTP draft head of the hybrid
+                        // qwen models attends only to the last N positions. Its KV cache becomes a sliding-window
+                        // ring of N + n_ubatch cells (the SWA part of llama_kv_cache_iswa is sized the same way), so a
+                        // draft token reads ~N KV rows instead of the whole context, and the ring size is fixed (stable
+                        // graph shapes for replay). Only the drafter changes; the target still verifies every token.
+                        if (mtp_on_hybrid_qwen) {
+                            const char * e = getenv("LLAMA_MTP_DRAFT_SWA");
+                            const int    w = e ? atoi(e) : 0;
+                            if (w > 0) {
+                                // LLAMA_MTP_DRAFT_SWA_SINK=S (default 0): also keep the first S positions visible
+                                const char * es = getenv("LLAMA_MTP_DRAFT_SWA_SINK");
+                                n_sink   = es ? (uint32_t) std::max(0, atoi(es)) : 0;
+                                n_swa    = (uint32_t) w;
+                                swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                const uint32_t ring = GGML_PAD((n_swa + n_sink)*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch, 256);
+                                kv_size  = std::min(kv_size, ring);
+                                LLAMA_LOG_INFO("%s: LLAMA_MTP_DRAFT_SWA: MTP draft KV is a sliding window of %u positions + %u sink (%u cells)\n",
+                                        __func__, n_swa, n_sink, kv_size);
+                            }
+                        }
+
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -2742,15 +2768,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa,
+                                swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
                                 nullptr);
+                        kv->set_swa_sink(n_sink);
+                        res = kv;
                     }
                 }
             }

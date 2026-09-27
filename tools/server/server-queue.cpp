@@ -2,6 +2,8 @@
 #include "server-queue.h"
 
 #include "log.h"
+#include "llama.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <chrono>
@@ -241,6 +243,8 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 
     {
+        // [spechost] LLAMA_HOST_PROF: how long the end of a yield waits for the worker thread to hand back
+        const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
         std::unique_lock<std::mutex> lock(mutex_tasks);
 
         // the yield is over, wait for the worker to finish its current task
@@ -249,6 +253,9 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         condition_tasks.wait(lock, [&]{
             return !worker.busy;
         });
+        if (hp_t0) {
+            llama_hprof_record("srv.yield_exit_wait", hp_t0);
+        }
 
         // put the declined tasks back, keeping their order
         while (!queue_tasks_unhandled.empty()) {

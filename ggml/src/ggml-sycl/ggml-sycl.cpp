@@ -34,6 +34,8 @@
 #include <utility>
 #include <chrono>
 #include <map>
+#include <tuple>
+#include <cstring>
 #include <string>
 #include <cstdio>
 #include <sycl/sycl.hpp>
@@ -69,6 +71,7 @@
 #include "ggml-sycl/mmq-dnn-u4.hpp"
 #include "ggml-sycl/mmq-xmx-q4k.hpp"
 #include "ggml-sycl/mmq-xmx-q6k.hpp"
+#include "ggml-sycl/mmq-xmx-q80.hpp"
 #include "ggml-sycl/dq-gemm.hpp"
 #include "ggml-sycl/fattn-xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -4896,6 +4899,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         // layout stays on MMVQ below
     }
 
+    // LOCAL: q8_0 x 2..8 columns on the XMX matrix units (mmq-xmx-q80.cpp), for the big q8_0 LM head at verify column
+    // counts: MMVQ reorder layout read in place. Default off (GGML_SYCL_XMX_Q80=1); weights under 64 MB stay on MMVQ.
+    if (!split && !smallrow && ggml_sycl_xmx_q80_can_use(ctx, src0, src1, dst)) {
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (extra && extra->optimized_feature.reorder) {
+            ggml_sycl_mul_mat_xmx_q80(ctx, src0, src1, dst);
+            return;
+        }
+    }
+
     // q6_K x 3..8 columns on the XMX matrix units (mmq-xmx-q6k.cpp): same scheme as q4_K above (MMVQ reorder layout
     // read in place, the same SoA q8_1 activations); small weights stay on MMVQ (can_use's minimum-work guards).
     // Default off (GGML_SYCL_XMX_Q6K=1).
@@ -6594,10 +6608,82 @@ static int ggml_sycl_gdn_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph *
     return -1;
 }
 
+// ---- LOCAL: GGML_SYCL_GDN_GATHER=1 (default off): fold the recurrent-state GET_ROWS into the GATED_DELTA_NET ----
+// build_rs gathers each gated-delta layer's input state (S_v * S_v * H floats, 3 MB on qwen35 27B) out of the state
+// cache with GET_ROWS(states, s_copy) into a fresh tensor that only the GDN op reads (through a RESHAPE). With one
+// sequence the GDN kernel can read that row of the cache itself: the GET_ROWS launch and its 2 x 3 MB of traffic
+// per layer go away. Only together with the snapshot-cache fusion (ggml_sycl_try_gdn_cache_fusion), and only when
+// nothing between the two nodes writes the cache rows. Pure data movement removed: bit-identical results.
+static bool ggml_sycl_gdn_gather_enabled() {
+    static const bool v = ggml_sycl_get_env("GGML_SYCL_GDN_GATHER", 0) != 0;
+    return v;
+}
+
+static const ggml_tensor * ggml_sycl_gdn_state_src(const ggml_tensor * t) {
+    // the GDN's state operand: a (chain of) RESHAPE of the gathered rows
+    while (t != nullptr && t->op == GGML_OP_RESHAPE && t->view_src != nullptr) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// node_idx is a GET_ROWS: returns the index of the GDN node it can be folded into, or -1
+static int ggml_sycl_gdn_gather_target(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    const ggml_tensor * st = gr->src[0];
+    const ggml_tensor * ix = gr->src[1];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 ||
+        ix->type != GGML_TYPE_I32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) || st->nb[0] != sizeof(float) ||
+        st->nb[1] % sizeof(float) != 0 || st->ne[2] != 1 || st->ne[3] != 1 || ix->ne[1] != 1 || ix->ne[2] != 1 ||
+        !ggml_is_contiguous(gr) || gr->ne[0] != st->ne[0] || gr->ne[1] != ix->ne[0] ||
+        ggml_sycl_gdn_use_count(cgraph, gr) != 1) {
+        return -1;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * ab = (const char *) a->data;
+        const char * bb = (const char *) b->data;
+        return ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
+    };
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET && ggml_sycl_gdn_state_src(n->src[5]) == gr) {
+            const ggml_tensor * s = n->src[5];
+            // every RESHAPE between the two must have this GDN as its only reader
+            for (const ggml_tensor * t = s; t != gr; t = t->src[0]) {
+                if (ggml_sycl_gdn_use_count(cgraph, t) != 1 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    return -1;
+                }
+            }
+            if (ggml_nelements(s) != ggml_nelements(gr) || s->ne[3] != gr->ne[1] ||
+                s->ne[0] * s->ne[1] * s->ne[2] != gr->ne[0]) {
+                return -1;
+            }
+            ggml_sycl_gated_delta_net_fused_cache probe;
+            if (ggml_sycl_try_gdn_cache_fusion(cgraph, j, probe) <= 0) {
+                return -1;
+            }
+            return j;
+        }
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        // nothing in between may write the cache or the index
+        if (overlaps(n, st) || overlaps(n, ix)) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_op_prof_graph_begin(cgraph);
     ggml_sycl_dnn_u4_graph_begin(sycl_ctx->stream());
+
+    // GGML_SYCL_GDN_GATHER: GET_ROWS nodes left out, each with the GDN node that reads the cache row instead
+    const ggml_tensor * gdn_gather_gr[64];
+    int                 gdn_gather_at[64];
+    int                 n_gdn_gather = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6606,6 +6692,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (node->op == GGML_OP_GET_ROWS && g_ggml_sycl_enable_fusion && ggml_sycl_gdn_gather_enabled() &&
+            n_gdn_gather < 64) {
+            const int at = ggml_sycl_gdn_gather_target(cgraph, i);
+            if (at > i) {
+                gdn_gather_gr[n_gdn_gather] = node;
+                gdn_gather_at[n_gdn_gather] = at;
+                ++n_gdn_gather;
+                static bool noted = false;
+                if (!noted) {
+                    noted = true;
+                    GGML_LOG_INFO("[SYCL-GDN-GATHER] recurrent-state gather folded into GATED_DELTA_NET\n");
+                }
+                continue;
+            }
         }
 
         ggml_sycl_op_prof_scope prof_scope(sycl_ctx, node);
@@ -6634,12 +6736,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
+            const ggml_tensor * gather_gr = nullptr;
+            for (int k = 0; k < n_gdn_gather; ++k) {
+                if (gdn_gather_at[k] == i) {
+                    gather_gr = gdn_gather_gr[k];
+                }
+            }
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                if (gather_gr != nullptr) {
+                    const ggml_sycl_gated_delta_net_state_gather gather = {
+                        (const float *) gather_gr->src[0]->data, (const int32_t *) gather_gr->src[1]->data,
+                        (int64_t) (gather_gr->src[0]->nb[1] / sizeof(float)) };
+                    ggml_sycl_op_gated_delta_net_fused_cache_gather(*sycl_ctx, node, fused_state_cpy, gather);
+                } else {
+                    ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                }
                 i += gdn_nodes_to_skip;
                 continue;
+            }
+            if (gather_gr != nullptr) {   // cannot happen (the target was checked); run the gather after all
+                GGML_ASSERT(ggml_sycl_compute_forward(*sycl_ctx, const_cast<ggml_tensor *>(gather_gr)));
             }
         }
         if (node->op == GGML_OP_RMS_NORM &&
@@ -6931,7 +7049,134 @@ static double   g_gstat_sig_us = 0;
 static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
 static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
 
+// ---- [spechost] GGML_SYCL_GRAPH_MISSLOG=N: explain why a graph got a NEW cache signature (eager/record instead of
+// replay). For every new signature it compares the graph node by node with the previous graph of the same shape class
+// (same context, n_nodes and token count) and reports the first node that differs and in what (its own data pointer,
+// its shape/strides/type, its op params, or a source's data pointer / shape). A signature that was already seen
+// before in this context is counted as "reseen" (it was evicted or flushed, not new). Aggregated per reason (layer
+// numbers folded to '#') and printed with the GGML_SYCL_GRAPH_STATS lines; the first N misses are also printed. ----
+struct ggml_sycl_gmiss_node { uint64_t data, shape, params, srcs_data, srcs_shape; };
+static std::map<std::string, uint64_t> g_gmiss_reason;
+static uint64_t g_gmiss_new = 0, g_gmiss_reseen = 0, g_gmiss_first = 0;
+
+static int ggml_sycl_graph_misslog() {
+    static const int n = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_MISSLOG", 0));
+    return n;
+}
+
+static void ggml_sycl_gmiss_fingerprint(const ggml_cgraph * cgraph, std::vector<ggml_sycl_gmiss_node> & out) {
+    out.resize(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        ggml_sycl_gsig sh, sp, sd, ss;
+        sh.add(((uint64_t) t->type << 40) | ((uint64_t) t->op << 8));
+        for (int d = 0; d < GGML_MAX_DIMS; d++) { sh.add((uint64_t) t->ne[d]); sh.add((uint64_t) t->nb[d]); }
+        for (size_t k = 0; k < GGML_MAX_OP_PARAMS / sizeof(uint64_t); k++) {
+            uint64_t w;
+            memcpy(&w, (const char *) t->op_params + k * sizeof(uint64_t), sizeof(w));
+            sp.add(w);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = t->src[j];
+            sd.add(s ? (uint64_t) (uintptr_t) s->data : 0xFFFFull + j);
+            if (s) {
+                ss.add(((uint64_t) s->type << 40) | ((uint64_t) s->op << 8));
+                for (int d = 0; d < GGML_MAX_DIMS; d++) { ss.add((uint64_t) s->ne[d]); ss.add((uint64_t) s->nb[d]); }
+            }
+        }
+        out[i] = { (uint64_t) (uintptr_t) t->data, sh.h1, sp.h1, sd.h1, ss.h1 };
+    }
+}
+
+static std::string ggml_sycl_gmiss_fold(const char * name) {
+    std::string r;
+    bool prev_digit = false;
+    for (const char * p = name; *p; ++p) {
+        const bool dig = *p >= '0' && *p <= '9';
+        if (dig) {
+            if (!prev_digit) r += '#';
+        } else {
+            r += *p;
+        }
+        prev_digit = dig;
+    }
+    return r;
+}
+
+static void ggml_sycl_graph_miss_analyze(const void * ctx_key, const ggml_cgraph * cgraph, uint64_t h1) {
+    const int nlog = ggml_sycl_graph_misslog();
+    if (nlog <= 0) {
+        return;
+    }
+    static std::map<std::pair<const void *, uint64_t>, bool> seen;          // (ctx, h1) -> seen
+    static std::map<std::tuple<const void *, int, int64_t>, std::vector<ggml_sycl_gmiss_node>> last;
+
+    int64_t ntok = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { ntok = cgraph->nodes[i]->ne[1]; break; }
+    }
+    auto & was = seen[{ ctx_key, h1 }];
+    std::vector<ggml_sycl_gmiss_node> cur;
+    ggml_sycl_gmiss_fingerprint(cgraph, cur);
+    auto & prev = last[{ ctx_key, cgraph->n_nodes, ntok }];
+
+    std::string reason;
+    if (was) {
+        g_gmiss_reseen++;
+        reason = "reseen (evicted or flushed)";
+    } else {
+        was = true;
+        g_gmiss_new++;
+        if (prev.empty()) {
+            reason = "first graph of this shape class";
+        } else {
+            int i = 0;
+            for (; i < (int) cur.size(); i++) {
+                const auto & a = cur[i];
+                const auto & b = prev[i];
+                if (a.data != b.data || a.shape != b.shape || a.params != b.params || a.srcs_data != b.srcs_data ||
+                    a.srcs_shape != b.srcs_shape) {
+                    break;
+                }
+            }
+            if (i == (int) cur.size()) {
+                reason = "identical fingerprint to the previous graph of this class (hash of leaf-only change?)";
+            } else {
+                const auto & a = cur[i];
+                const auto & b = prev[i];
+                const ggml_tensor * t = cgraph->nodes[i];
+                const char * field = a.shape != b.shape ? "shape" : a.params != b.params ? "op_params" :
+                                     a.srcs_shape != b.srcs_shape ? "src_shape" : a.data != b.data ? "data_ptr" : "src_data_ptr";
+                std::string src_name;
+                if (!strcmp(field, "src_data_ptr") || !strcmp(field, "src_shape")) {
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (t->src[j]) { src_name += std::string(src_name.empty() ? "" : ",") + ggml_sycl_gmiss_fold(t->src[j]->name); }
+                    }
+                }
+                reason = std::string(ggml_op_name(t->op)) + " " + field + " @" + ggml_sycl_gmiss_fold(t->name) +
+                         (src_name.empty() ? "" : " srcs[" + src_name + "]");
+                if (g_gmiss_first < (uint64_t) nlog) {
+                    g_gmiss_first++;
+                    fprintf(stderr, "[SYCL-GRAPH-MISS] n_nodes=%d ntok=%lld node #%d '%s' %s ne=[%lld,%lld,%lld,%lld] data=%p (prev %p)\n",
+                            cgraph->n_nodes, (long long) ntok, i, t->name, reason.c_str(),
+                            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                            t->data, (void *) (uintptr_t) b.data);
+                }
+            }
+        }
+    }
+    g_gmiss_reason[std::string(cgraph->n_nodes >= 1000 ? "big " : "small ") + reason]++;
+    prev.swap(cur);
+}
+
 static void ggml_sycl_graph_stats_print() {
+    if (ggml_sycl_graph_misslog() > 0) {
+        fprintf(stderr, "[SYCL-GRAPH-MISS] new=%llu reseen=%llu; by reason:\n", (unsigned long long) g_gmiss_new,
+                (unsigned long long) g_gmiss_reseen);
+        for (auto & kv : g_gmiss_reason) {
+            fprintf(stderr, "[SYCL-GRAPH-MISS]   %6llu  %s\n", (unsigned long long) kv.second, kv.first.c_str());
+        }
+    }
     const uint64_t n = g_gstat_replay + g_gstat_record + g_gstat_eager;
     fprintf(stderr, "[SYCL-GRAPH] calls=%llu replay=%llu record=%llu eager=%llu fail=%llu flush=%llu evict=%llu selftest_inplace_skip=%llu sig=%.1f us/call\n",
                   (unsigned long long) n, (unsigned long long) g_gstat_replay, (unsigned long long) g_gstat_record,
@@ -7131,6 +7376,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
     if (it == ctx->graph_cache.end()) {
         it = ctx->graph_cache.emplace(h1, ggml_backend_sycl_context::graph_cache_entry{}).first;
         it->second.sig = { h2, (uint64_t) cgraph->n_nodes };
+        ggml_sycl_graph_miss_analyze(ctx, cgraph, h1);  // [spechost] GGML_SYCL_GRAPH_MISSLOG
     }
     auto & e = it->second;
     e.last_use = ++ctx->graph_cache_tick;

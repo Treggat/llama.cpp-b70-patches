@@ -400,10 +400,69 @@ void xfa_launch_combine(sycl::queue & q, const xfa_params p) {
     });
 }
 
+// GGML_SYCL_XMX_FA_COMBINE=2 (LOCAL, default off): the same combine with the per-chunk weights computed once per
+// work-group into SLM by one sub-group (max over chunks, then w_c = exp2(m_c - M) and L in chunk order, as above) and
+// the Opart loop unrolled, so the chunk loads overlap. The arithmetic and its order are unchanged: bit-identical
+// output. Measured standalone (xmx_fa.cpp CV 2, kv 65536): 20 -> 13 us at 6/8 tokens, 10 -> 6 us at 2 tokens.
+static bool ggml_sycl_fattn_xmx_v2() {
+    // GGML_SYCL_XMX_FA_V2=1 (LOCAL, default off): the retuned launch (see ggml_sycl_fattn_xmx) + the combine below
+    static const bool v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_V2", 0) != 0;
+    return v;
+}
+
+static bool ggml_sycl_fattn_xmx_combine2() {
+    static const int  e = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_COMBINE", 0);
+    static const bool v = e == 2 || (e == 0 && ggml_sycl_fattn_xmx_v2());
+    return v;
+}
+
+static constexpr int XFA_CMAX = 1024;   // chunks per (KV head, split) the SLM weight table holds
+
+template <int R8>
+void xfa_launch_combine2(sycl::queue & q, const xfa_params p) {
+    constexpr int D = XFA_D;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> Wl(sycl::range<1>(XFA_CMAX + 1), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) p.nhkv * p.R * D, D), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int dv = it.get_local_linear_id();
+            const int gi = it.get_group_linear_id();
+            const int hk = gi % p.nhkv, r = gi / p.nhkv;
+            const int split = r / p.Rw, rl = r % p.Rw;
+            float * wsl = Wl.get_multi_ptr<sycl::access::decorated::no>().get();
+            const int64_t cstride = (int64_t) p.nhkv * p.qs * R8;              // ML stride between chunks
+            const int64_t base    = ((int64_t) hk * p.qs + split) * R8 + rl;   // chunk 0
+            if (dv < 16) {
+                float m = -1e30f;
+                for (int c = dv; c < p.nchunks; c += 16) m = sycl::fmax(m, p.ML[c * cstride + base].x());
+                const float M = sycl::reduce_over_group(it.get_sub_group(), m, sycl::maximum<float>());
+                for (int c = dv; c < p.nchunks; c += 16) wsl[c] = sycl::exp2(p.ML[c * cstride + base].x() - M);
+                sycl::group_barrier(it.get_sub_group());
+                if (dv == 0) {
+                    float L = 0.f;
+                    for (int c = 0; c < p.nchunks; ++c) L += wsl[c] * p.ML[c * cstride + base].y();
+                    wsl[XFA_CMAX] = L;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            float acc = 0.f;
+            const float * op = p.Opart + base * D + dv;
+#pragma unroll 8
+            for (int c = 0; c < p.nchunks; ++c) acc += wsl[c] * op[c * cstride * D];
+            const float L = wsl[XFA_CMAX];
+            const int t = r / p.ratio, hq = hk * p.ratio + r % p.ratio;
+            p.dst[t * p.d_s2 + hq * p.d_s1 + dv] = L > 0.f ? acc / L : 0.f;
+        });
+    });
+}
+
 template <int MT8, int NT16>
 void xfa_run(sycl::queue & q, const xfa_params & p) {
     xfa_launch_main<MT8, NT16>(q, p);
-    xfa_launch_combine<MT8 * 8>(q, p);
+    if (ggml_sycl_fattn_xmx_combine2() && p.nchunks <= XFA_CMAX) {
+        xfa_launch_combine2<MT8 * 8>(q, p);
+    } else {
+        xfa_launch_combine<MT8 * 8>(q, p);
+    }
 }
 
 void xfa_dispatch(sycl::queue & q, const xfa_params & p) {
@@ -436,9 +495,12 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     // query-token splits per (head, chunk): default 2 for R > 24 with an even token count (nb 6/8), measured
     // 704->614 us (nb 6) and 762->637 us (nb 8) at kv 65536; the split work-groups are adjacent so the second
     // K/V read mostly hits L2
+    // GGML_SYCL_XMX_FA_V2: split any R > 30 in two (the row -> (token, head) map is per row, so a split need not fall on
+    // a token boundary): 7 tokens (42 rows) 725 -> 623 us at kv 65536; 5 tokens (30 rows) stays whole (511 vs 552)
     static const int qs_env = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_QS", 0);
-    int qs = (R > 24 && nb % 2 == 0) ? 2 : 1;
-    if (qs_env > 0 && nb % qs_env == 0 && (R / qs_env) <= XFA_MAXR) {
+    const bool v2 = ggml_sycl_fattn_xmx_v2();
+    int qs = v2 ? ((R > 30 && R % 2 == 0) ? 2 : 1) : ((R > 24 && nb % 2 == 0) ? 2 : 1);
+    if (qs_env > 0 && (v2 ? R % qs_env : nb % qs_env) == 0 && (R / qs_env) <= XFA_MAXR) {
         qs = qs_env;
     }
     const int Rw  = R / qs;
@@ -453,7 +515,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     if (chunk_env > 0) {
         chunk = chunk_env;
     } else {
-        const int want = std::max(1, (ncu / 8) * 4 / nhkv);
+        // V2: count the query splits too, so a split launch is still one wave of ~4 work-groups per Xe core (the
+        // two-wave launch measured 25-30 us slower per layer at 32k..80k, 8 tokens: 630 -> 606 us at kv 65536)
+        const int want = std::max(1, (ncu / 8) * 4 / (nhkv * (v2 ? qs : 1)));
         chunk = std::max(XFA_T, ((kv + want - 1) / want + XFA_T - 1) / XFA_T * XFA_T);
     }
     chunk = (chunk + XFA_T - 1) / XFA_T * XFA_T;

@@ -1758,6 +1758,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const int64_t hp_th = llama_hprof_enabled() ? ggml_time_us() : 0;
+        struct hp_rec_h { int64_t t0; ~hp_rec_h() { if (t0) llama_hprof_record("mtp.process_h_rows", t0); } } hp_rh { hp_th };
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;

@@ -1813,9 +1813,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // [spechost] LLAMA_HOST_PROF: host time of the batch/memory preparation before the first ubatch
+    const bool    hp_dec   = llama_hprof_mode() > 0;
+    const int64_t hp_dec_t = hp_dec ? ggml_time_us() : 0;
+    const std::string hp_dec_tag = hp_dec ? std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + (batch_inp.n_tokens <= 16 ? "" : ".pp") : std::string();
+
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+    if (hp_dec) {
+        llama_hprof_add(hp_dec_tag + ".prep.balloc", hp_dec_t);
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -1857,6 +1865,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const int64_t hp_dec_t1 = hp_dec ? ggml_time_us() : 0;
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -1898,6 +1907,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         break;
+    }
+    if (hp_dec) {
+        llama_hprof_add(hp_dec_tag + ".prep.mem_init_batch", hp_dec_t1);
     }
 
     // reserve output buffer

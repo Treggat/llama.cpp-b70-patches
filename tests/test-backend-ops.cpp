@@ -4752,6 +4752,81 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// LOCAL (not for upstream): qwen35 build_rs + build_recurrent_attn with rollback slots, as the verify graph runs it:
+//   state = GET_ROWS(cache, idx) -> RESHAPE -> GATED_DELTA_NET(K) -> CPY of the K snapshots into the cache planes
+// (the SYCL GGML_SYCL_GDN_GATHER fusion reads the cache row inside the GDN kernel instead of the GET_ROWS copy).
+// The cache has mem rows per plane and K planes; idx picks the input row (row_in: a rollback plane may be the one the
+// snapshots overwrite, which the fused kernel must read before it writes). The result gathers the written snapshots
+// and the attention output.
+struct test_gdn_gather : public test_case {
+    const int64_t head_count, head_size, n_tokens, K, mem, row_in;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GDN_GATHER"; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 1ULL << 50; }   // perf: one run = the graph
+    std::string vars() override { return VARS_TO_STR6(head_count, head_size, n_tokens, K, mem, row_in); }
+    bool run_whole_graph() override { return true; }
+
+    test_gdn_gather(int64_t head_count = 4, int64_t head_size = 128, int64_t n_tokens = 8, int64_t K = 8,
+                    int64_t mem = 2, int64_t row_in = 0)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens), K(K), mem(mem), row_in(row_in) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size, H = head_count, D = S_v * S_v * H;
+        const int64_t n_written = std::min<int64_t>(n_tokens, K);
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, 1);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, 1);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, 1);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem * K);
+        ggml_tensor * idx  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(cache, "cache");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * state = ggml_get_rows(ctx, cache, idx);
+        state = ggml_reshape_4d(ctx, state, S_v, S_v, H, 1);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, ggml_l2_norm(ctx, q, 1e-6f), ggml_l2_norm(ctx, k, 1e-6f), v, g,
+                                                 beta, state, K);
+        const int64_t attn_elems = S_v * H * n_tokens;
+        ggml_tensor * src = ggml_view_3d(ctx, gdn, D, 1, n_written, ggml_row_size(gdn->type, D),
+                                         ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, attn_elems));
+        ggml_tensor * dst = ggml_view_3d(ctx, cache, D, 1, n_written, cache->nb[1], mem * cache->nb[1], 0);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn, S_v, H, n_tokens, 1, ggml_row_size(gdn->type, S_v),
+                                          ggml_row_size(gdn->type, S_v * H), ggml_row_size(gdn->type, attn_elems), 0);
+        // the cpy first (it must directly follow the GDN for the snapshot-cache fusion), then the attention output
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, ggml_cont(ctx, cpy), D * n_written),
+                                        ggml_reshape_1d(ctx, ggml_cont(ctx, attn), attn_elems), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "idx") == 0) {
+                const int32_t r = (int32_t) row_in;
+                ggml_backend_tensor_set(t, &r, 0, sizeof(r));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -10130,6 +10205,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
         }
     }
+    // LOCAL (not for upstream): q8_0 for the SYCL XMX q8_0 path (mmq-xmx-q80.cpp, GGML_SYCL_XMX_Q80=1; run with
+    // GGML_SYCL_XMX_Q80_MIN_MB=0 so the small shapes take it): the house LM head (248320 x 5120) at 2 and 8 columns,
+    // a mid-size weight, a single 256-block K, split-K shapes and odd K / rows it must decline
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {4096, 5120}, {1024, 256}, {64, 2816}, {160, 5120}, {48, 5120} }) {
+        for (int nc : { 1, 2, 3, 5, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int nc : { 2, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, nc, 5120, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nc, 5152, { 1, 1 }, { 1, 1 }));
+    }
     // LOCAL (not for upstream): SYCL XMX q4_K / q6_K edge shapes. K = 11*256 pads the q8_1 row to 3072 with the ds
     // values at the unpadded K; 4100 rows is not a multiple of the 16-row tile, so XMX must decline and MMVQ serve it.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
@@ -10983,6 +11071,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // LOCAL: qwen35 recurrent-state gather + rollback snapshots (SYCL GGML_SYCL_GDN_GATHER): the input row in plane 0,
+    // in a rollback plane that the snapshots overwrite (row mem * p), and in a plane they do not reach
+    for (int64_t n : { 1, 3, 8 }) {
+        for (int64_t row_in : { 0, 2 * 2, 7 * 2 + 1 }) {
+            test_cases.emplace_back(new test_gdn_gather(4, 128, n, 8, 2, row_in));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_gather(48, 128, 8, 8, 1, 3));
+    test_cases.emplace_back(new test_gdn_gather(4, 64, 5, 3, 3, 4));
     // LOCAL (xmx-fa probe): Qwen3.8-27B seat decode/verify shapes, real KV-cache layout.
     for (int kv : { 4096, 32768, }) {
         for (int nb : { 1, 2, 4, 6, 8, }) {
@@ -11384,6 +11481,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int k : { 10, 20 }) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
     }
+    // LOCAL (spechost): per-draft-token GPU cost of the MTP drafter: q4_K draft head (98304 rows), q4_K MTP layer
+    // shapes at 1 column, and the MTP layer's attention over the seat KV (f16 vs q8_0 KV, full context vs a window)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 98304, 1, 5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 49152, 1, 5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32768, 1, 5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 1, 10240, { 1, 1 }, { 1, 1 }));
+    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int kv : { 2048, 4096, 8192, 40960, 65536, 81920 }) {
+            for (int nb : { 1, 6 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false));
+            }
+        }
+    }
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248320, 1, 1, 1}));
 
     // LOCAL (not for upstream): model-shape q4_K matmuls at verify column counts (SYCL oneDNN u4 path vs MMVQ)
@@ -11400,6 +11510,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, nc, 5120, { 1, 1 }, { 1, 1 }));
             }
         }
+    }
+    // LOCAL: qwen35 recurrent-state gather + 8 rollback snapshots, 48 heads x 128 (SYCL GGML_SYCL_GDN_GATHER)
+    for (int64_t n : { 1, 8 }) {
+        test_cases.emplace_back(new test_gdn_gather(48, 128, n, 8, 1, 3));
     }
     // LOCAL: 8 chained qwen35 gated-delta layers (SYCL GDN fusions) at verify token counts
     for (int nc : { 1, 4, 6, 8 }) {
@@ -11727,8 +11841,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // LOCAL (xmx-fa probe): Qwen3.8-27B seat decode/verify shapes. hs 256, 4 KV heads, GQA 6,
     // real KV-cache layout (permute {0,2,1,3}, no view: K nb1 = 4*256*2 = 2048, nb2 = 512), f16 KV.
-    for (int kv : { 4096, 32768, 49152, 65536, 131072, }) {
-        for (int nb : { 1, 2, 3, 4, 5, 6, 8, }) {
+    for (int kv : { 4096, 32768, 49152, 65536, 81920, 131072, }) {
+        for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
         }
     }

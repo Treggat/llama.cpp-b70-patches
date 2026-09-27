@@ -463,6 +463,12 @@ int xmx_q4k_pick_ks(int N, int K, int M) {
             ks = t.ks;
         }
     }
+    // GGML_SYCL_XMX_KS_V2=1 (LOCAL, default off): 5120x6144 (ssm_out, attn_output: 64 ops per verify graph) ks 3:
+    // 26.0 -> 22.2 us at 3..8 columns (the rule's 6 leaves the 320 tiles at 5 work-groups per Xe core)
+    static const bool ks_v2 = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_KS_V2", 0) != 0;
+    if (ks_v2 && N == 5120 && K == 6144) {
+        ks = 3;
+    }
     static const int ks_env = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_KS", 0);
     if (ks_env > 0) {
         ks = ks_env;

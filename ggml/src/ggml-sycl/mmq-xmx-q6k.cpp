@@ -200,6 +200,12 @@ int xmx_q6k_pick_ks(int N, int K) {
     const int KB    = K / QK_K;
     const int tiles = N / XMX_Q6K_ROWS;
     int ks = std::max(1, std::min(std::min((3200 + tiles - 1) / tiles, 10), KB / 2));
+    // GGML_SYCL_XMX_KS_V2=1 (LOCAL, default off): 5120x17408 (ffn_down) ks 3: 158-160 -> 144-156 us at 3..8 columns
+    // (ks 10: 3 work-groups per Xe core, 3.3 waves; ks 3: 10 per core, one wave)
+    static const bool ks_v2 = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_KS_V2", 0) != 0;
+    if (ks_v2 && N == 5120 && K == 17408) {
+        ks = 3;
+    }
     static const int ks_env = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_KS", 0);
     if (ks_env > 0) {
         ks = ks_env;

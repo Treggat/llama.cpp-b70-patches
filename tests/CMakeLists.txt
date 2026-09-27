@@ -379,3 +379,6 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# LOCAL (spechost): graph-input upload host cost / correctness probe (GGML_SYCL_ASYNC_INPUTS)
+llama_build(test-spechost-inputs.cpp)

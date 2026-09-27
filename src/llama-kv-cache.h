@@ -118,6 +118,10 @@ public:
 
     ~llama_kv_cache() = default;
 
+    // [spechost] attention sinks for a sliding-window cache: positions < n are never masked by the window and
+    // their cells are never recycled (LLAMA_MTP_DRAFT_SWA_SINK for the MTP draft ring). 0 = off.
+    void set_swa_sink(uint32_t n) { n_swa_sink = n; }
+
     //
     // llama_memory_i
     //
@@ -269,6 +273,7 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+    uint32_t n_swa_sink = 0; // [spechost] see set_swa_sink()
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -817,6 +818,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    struct ggml_sched_input_stage * istage; // [spechost] GGML_SYCL_ASYNC_INPUTS staging ring (NULL = off / not created)
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1643,6 +1645,133 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// [spechost] GGML_SYCL_ASYNC_INPUTS=1 (default 0): user graph inputs of a SYCL split are uploaded without blocking.
+// The scheduler copies each split's input bytes (host memcpy, so the caller may overwrite its tensors as soon as
+// compute returns) into its own pinned staging ring allocated from the split device's host buffer type, enqueues one
+// set_tensor_async per input from the ring (the backend's in-order queue orders it after all earlier work and before
+// the split's graph), and records an event after them. A ring region is reused only after its event has completed.
+// Splits whose inputs do not fit half the ring (e.g. prefill KQ masks) keep the original synchronous path.
+// GGML_SYCL_ASYNC_INPUTS_MB sets the ring size (default 64).
+struct ggml_sched_input_stage {
+    int                   backend_id = -1;
+    ggml_backend_buffer_t buf        = nullptr;
+    char *                base       = nullptr;
+    size_t                size       = 0;
+    size_t                head       = 0;
+    struct pending_t { size_t beg, end; ggml_backend_event_t ev; };
+    std::deque<pending_t>             pending; // submission order
+    std::vector<ggml_backend_event_t> free_ev;
+
+    ~ggml_sched_input_stage() {
+        for (auto & p : pending) {
+            ggml_backend_event_synchronize(p.ev);
+            ggml_backend_event_free(p.ev);
+        }
+        for (auto * e : free_ev) {
+            ggml_backend_event_free(e);
+        }
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+};
+
+static bool ggml_sched_async_inputs_env() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SYCL_ASYNC_INPUTS");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool ggml_sched_input_stageable(const ggml_tensor * input, const ggml_tensor * input_cpy) {
+    return (input->flags & GGML_TENSOR_FLAG_INPUT) && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+           input->data && ggml_is_contiguous(input) && input_cpy->buffer && ggml_nbytes(input) == ggml_nbytes(input_cpy);
+}
+
+// reserve `n` bytes of the ring for one split; returns the offset or SIZE_MAX when staging is not possible
+static size_t ggml_sched_stage_reserve(ggml_backend_sched_t sched, int backend_id, size_t n) {
+    ggml_backend_t backend = sched->backends[backend_id];
+    if (backend->iface.set_tensor_async == NULL || strncmp(ggml_backend_name(backend), "SYCL", 4) != 0) {
+        return SIZE_MAX;
+    }
+    if (sched->istage == NULL) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : NULL;
+        ggml_backend_event_t ev0 = dev ? ggml_backend_event_new(dev) : NULL;
+        if (hbt == NULL || ev0 == NULL) {
+            if (ev0) {
+                ggml_backend_event_free(ev0);
+            }
+            return SIZE_MAX;
+        }
+        size_t mb = 64;
+        if (const char * e = getenv("GGML_SYCL_ASYNC_INPUTS_MB")) {
+            mb = (size_t) std::max(1, atoi(e));
+        }
+        auto * st = new ggml_sched_input_stage();
+        st->buf = ggml_backend_buft_alloc_buffer(hbt, mb << 20);
+        if (st->buf == NULL) {
+            ggml_backend_event_free(ev0);
+            delete st;
+            return SIZE_MAX;
+        }
+        st->backend_id = backend_id;
+        st->base = (char *) ggml_backend_buffer_get_base(st->buf);
+        st->size = ggml_backend_buffer_get_size(st->buf);
+        st->free_ev.push_back(ev0);
+        sched->istage = st;
+    }
+    auto & st = *sched->istage;
+    if (st.backend_id != backend_id || n == 0 || n > st.size / 2) {
+        return SIZE_MAX;
+    }
+    if (st.head + n > st.size) {
+        st.head = 0;
+    }
+    const size_t beg = st.head, end = st.head + n;
+    // events complete in submission order: wait for the newest pending region that overlaps, retire it and all older
+    int last = -1;
+    for (int i = 0; i < (int) st.pending.size(); ++i) {
+        if (st.pending[i].beg < end && beg < st.pending[i].end) {
+            last = i;
+        }
+    }
+    if (last >= 0) {
+        ggml_backend_event_synchronize(st.pending[last].ev);
+        for (int i = 0; i <= last; ++i) {
+            st.free_ev.push_back(st.pending.front().ev);
+            st.pending.pop_front();
+        }
+    }
+    st.head = end;
+    return beg;
+}
+
+// record the event that marks the end of the uploads from [beg, end)
+static void ggml_sched_stage_commit(ggml_backend_sched_t sched, int backend_id, size_t beg, size_t end) {
+    auto & st = *sched->istage;
+    ggml_backend_event_t ev = NULL;
+    if (!st.free_ev.empty()) {
+        ev = st.free_ev.back();
+        st.free_ev.pop_back();
+    } else {
+        ev = ggml_backend_event_new(ggml_backend_get_device(sched->backends[backend_id]));
+    }
+    if (ev == NULL) {
+        // cannot track the region: let the uploads complete now
+        ggml_backend_synchronize(sched->backends[backend_id]);
+        return;
+    }
+    ggml_backend_event_record(ev, sched->backends[backend_id]);
+    st.pending.push_back({ beg, end, ev });
+    while (st.pending.size() > 256) {
+        ggml_backend_event_synchronize(st.pending.front().ev);
+        st.free_ev.push_back(st.pending.front().ev);
+        st.pending.pop_front();
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1668,13 +1797,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // [spechost] GGML_SYCL_ASYNC_INPUTS: reserve one staging region for all user inputs of this split
+        size_t st_beg = SIZE_MAX, st_off = 0;
+        if (ggml_sched_async_inputs_env()) {
+            size_t st_total = 0;
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (ggml_sched_input_stageable(input, tensor_copy(input, split_backend_id, sched->cur_copy))) {
+                    st_total += GGML_PAD(ggml_nbytes(input), 256);
+                }
+            }
+            if (st_total > 0) {
+                st_beg = ggml_sched_stage_reserve(sched, split_backend_id, st_total);
+                st_off = st_beg;
+            }
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
+                // [spechost] staged upload: capture the bytes now, upload from the pinned ring without blocking
+                const size_t n = ggml_nbytes(input);
+                char * src = sched->istage->base + st_off;
+                memcpy(src, input->data, n);
+                ggml_backend_tensor_set_async(split_backend, input_cpy, src, 0, n);
+                st_off += GGML_PAD(n, 256);
+            } else if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1793,6 +1945,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (st_beg != SIZE_MAX) {
+            ggml_sched_stage_commit(sched, split_backend_id, st_beg, st_off);
         }
 
         if (!sched->callback_eval) {
@@ -1921,6 +2077,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    delete sched->istage; // [spechost] waits for its pending uploads
+    sched->istage = NULL;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
