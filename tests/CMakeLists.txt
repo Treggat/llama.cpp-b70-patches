@@ -382,3 +382,7 @@ endif()
 
 # LOCAL (spechost): graph-input upload host cost / correctness probe (GGML_SYCL_ASYNC_INPUTS)
 llama_build(test-spechost-inputs.cpp)
+
+# LOCAL (hostv): LLAMA_GRAPH_REUSE_MULTI end-to-end exactness / host-time probe on a random tiny QWEN35 (+MTP)
+llama_build(test-hostv-reuse.cpp)
+llama_build(test-hostv-sampling.cpp)

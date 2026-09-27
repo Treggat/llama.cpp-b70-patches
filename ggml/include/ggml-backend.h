@@ -336,6 +336,14 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // [hostv] snapshots of an allocated graph: capture the scheduler state right after ggml_backend_sched_alloc_graph
+    // (NULL if unsupported, e.g. pipeline parallelism), restore it later to compute that same graph again without
+    // splitting/allocating it (returns false if the compute buffers were reallocated since, i.e. the snapshot is stale)
+    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
+    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_new(ggml_backend_sched_t sched);
+    GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
+    GGML_API void                          ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

@@ -348,6 +348,7 @@ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 // cache (GGML_SYCL_ENABLE_GRAPH=1) drops every recorded graph when it changes, so a replayed graph can
 // never point at freed memory.
 extern std::atomic<uint64_t> g_ggml_sycl_mem_epoch;
+extern std::atomic<uint64_t> g_ggml_sycl_opt_epoch; // [hostv] bumped when a weight gets reordered / repacked
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
@@ -480,6 +481,17 @@ struct ggml_backend_sycl_context {
     std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
     uint64_t graph_cache_epoch = 0;
     uint64_t graph_cache_tick  = 0;
+
+    // [hostv] GGML_SYCL_GRAPH_SIG_MEMO: split graph uid -> signature
+    struct sig_memo_entry {
+        ggml_tensor ** nodes     = nullptr;
+        int            n_nodes   = 0;
+        uint64_t       opt_epoch = 0;
+        uint64_t       mem_epoch = 0;
+        uint64_t       h1 = 0, h2 = 0;
+        bool           valid = false;
+    };
+    std::unordered_map<uint64_t, sig_memo_entry> sig_memo;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

@@ -162,6 +162,9 @@ struct common_sampler {
             const int32_t k = fast_top_k();
             if (k > 0 && k < n_vocab) {
                 select_top_k(logits, n_vocab, k);
+                if (fast_top_k_mode() == 2) {
+                    check_top_k(logits, n_vocab, k);
+                }
                 cur_p = { cur.data(), cur.size(), -1, true };
                 return;
             }
@@ -178,8 +181,14 @@ struct common_sampler {
     // env LLAMA_SAMPLER_FAST_TOPK=1: returns top_k when everything the chain runs before top-k is a no-op
     // (no logit bias / suppress list, neutral penalties, DRY and top-n-sigma off) and no grammar or reasoning
     // budget sees the full vocab; 0 otherwise
+    // [hostv] =2: also run the reference (full-vocab std::partial_sort) selection and abort on any difference
+    static int fast_top_k_mode() {
+        static const int mode = getenv("LLAMA_SAMPLER_FAST_TOPK") ? atoi(getenv("LLAMA_SAMPLER_FAST_TOPK")) : 0;
+        return mode;
+    }
+
     int32_t fast_top_k() const {
-        static const bool enabled = getenv("LLAMA_SAMPLER_FAST_TOPK") && atoi(getenv("LLAMA_SAMPLER_FAST_TOPK")) != 0;
+        const bool enabled = fast_top_k_mode() != 0;
         if (!enabled || grmr || rbudget || params.mirostat != 0 || params.top_k <= 0) {
             return 0;
         }
@@ -188,6 +197,12 @@ struct common_sampler {
             const std::string name = llama_sampler_name(llama_sampler_chain_get(chain, i));
             if (name == "top-k") {
                 return params.top_k;
+            }
+            // [hostv] disabled samplers are replaced by llama_sampler_init_empty("?<name>"), whose apply/accept do
+            // nothing: with the default --samplers order every sampler before top-k is one of those, and the old
+            // name checks below never matched them, so the fast path was never taken
+            if (!name.empty() && name[0] == '?') {
+                continue;
             }
             const bool noop =
                 (name == "penalties"   && (params.penalty_last_n == 0 || (params.penalty_repeat == 1.0f &&
@@ -201,40 +216,80 @@ struct common_sampler {
         return 0;
     }
 
-    // k largest logits, sorted by logit descending (ties: lower id first), into cur
+    // [hostv] the k best logits in exactly the order the chain's top-k sampler would leave them: that sampler runs
+    // std::partial_sort(first, first + k, last, logit >) over all n_vocab entries in id order, i.e. a heap select
+    // (make_heap of the first k, then for every later entry that is strictly better than the heap top a pop_heap
+    // that moves it in) followed by sort_heap. The same standard-library heap operations on the same entries in the
+    // same order reproduce its result bit for bit, ties included; entries that are not strictly better than the top
+    // are no-ops there, so whole 64-entry blocks without such an entry are skipped with a branch-free test.
     void select_top_k(const float * logits, int n_vocab, int k) {
-        auto better = [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
         };
-        cur.resize(k);
+        cur.resize(k + 1);
         for (int i = 0; i < k; ++i) {
             cur[i] = llama_token_data{i, logits[i], 0.0f};
         }
-        // min-heap on "better": cur[0] is the worst of the kept k
-        std::make_heap(cur.begin(), cur.end(), better);
+        std::make_heap(cur.begin(), cur.begin() + k, comp);
         float thr = cur[0].logit;
-        // blocks of 64: a vectorisable max skips every block that cannot beat the current k-th best
         constexpr int B = 64;
         for (int i = k, end; i < n_vocab; i = end) {
             end = std::min(n_vocab, (i / B + 1) * B);
-            float m = logits[i];
-            for (int j = i + 1; j < end; ++j) {
-                m = std::max(m, logits[j]);
+            int any = 0;
+            for (int j = i; j < end; ++j) {
+                any |= logits[j] > thr;
             }
-            if (!(m > thr)) {
+            if (!any) {
                 continue;
             }
             for (int j = i; j < end; ++j) {
-                const float l = logits[j];
-                if (l > thr) { // an equal logit has a higher id than every kept tie, so it never wins
-                    std::pop_heap(cur.begin(), cur.end(), better);
-                    cur.back() = llama_token_data{j, l, 0.0f};
-                    std::push_heap(cur.begin(), cur.end(), better);
+                if (logits[j] > thr) {
+                    // == libstdc++ __heap_select: __pop_heap(first, middle, &entry_j)
+                    cur[k] = llama_token_data{j, logits[j], 0.0f};
+                    std::pop_heap(cur.begin(), cur.begin() + k + 1, comp);
                     thr = cur[0].logit;
                 }
             }
         }
-        std::sort(cur.begin(), cur.end(), better);
+        cur.resize(k);
+        std::sort_heap(cur.begin(), cur.end(), comp);
+    }
+
+    // LLAMA_SAMPLER_FAST_TOPK=2: compare against the reference path on the real logits and on a copy rounded to a
+    // coarse grid (many exact ties), abort on any difference
+    void check_top_k(const float * logits, int n_vocab, int k) {
+        static int64_t n_checked = 0;
+        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        };
+        std::vector<llama_token_data> fast = cur;
+        for (int pass = 0; pass < 2; ++pass) {
+            std::vector<float> rounded;
+            const float * lg = logits;
+            if (pass == 1) {
+                rounded.resize(n_vocab);
+                for (int i = 0; i < n_vocab; ++i) {
+                    rounded[i] = std::round(logits[i] * 4.0f) / 4.0f;
+                }
+                lg = rounded.data();
+                select_top_k(lg, n_vocab, k);
+            }
+            std::vector<llama_token_data> ref(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) {
+                ref[i] = llama_token_data{i, lg[i], 0.0f};
+            }
+            std::partial_sort(ref.begin(), ref.begin() + k, ref.end(), comp);
+            for (int i = 0; i < k; ++i) {
+                if (ref[i].id != cur[i].id || memcmp(&ref[i].logit, &cur[i].logit, sizeof(float)) != 0) {
+                    GGML_ABORT("LLAMA_SAMPLER_FAST_TOPK=2: top-k mismatch at %d (pass %d): id %d vs %d", i, pass, cur[i].id, ref[i].id);
+                }
+            }
+        }
+        cur = fast;
+        if ((++n_checked & (n_checked - 1)) == 0) {
+            LOG_INF("%s: LLAMA_SAMPLER_FAST_TOPK=2: %lld top-k selections identical to the reference (incl. tie-heavy copies)\n",
+                    __func__, (long long) n_checked);
+        }
     }
 
     common_time_meas tm() {

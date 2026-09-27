@@ -211,6 +211,7 @@ public:
     const llama_tokens & get_tokens() const;
 
     llama_tokens get_text_tokens() const;
+    void get_text_tokens(llama_tokens & out) const; // [hostv] same content, reuses out's capacity
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);

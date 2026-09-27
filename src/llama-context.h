@@ -374,6 +374,33 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // [hostv] env LLAMA_GRAPH_REUSE_MULTI=1 (default 0): besides the two gf_res_prev graphs, keep up to
+    // LLAMA_GRAPH_REUSE_MULTI_MAX (default 16) built + allocated graphs for ubatches of at most
+    // LLAMA_GRAPH_REUSE_MULTI_TOKENS (default 16) tokens, e.g. one per speculative verify / catch-up size, each with a
+    // snapshot of the scheduler state. A later ubatch whose graph would be identical (llm_graph_result::can_reuse, the
+    // same test as the single-graph reuse) restores that snapshot instead of rebuilding, splitting and allocating the
+    // graph. The least recently used entry is rebuilt in place when the cache is full.
+    struct graph_cache_entry {
+        llm_graph_result_ptr          res;
+        ggml_backend_sched_snapshot_t snap     = nullptr;
+        uint64_t                      last_use = 0;
+
+        graph_cache_entry() = default;
+        graph_cache_entry(const graph_cache_entry &) = delete;
+        graph_cache_entry & operator=(const graph_cache_entry &) = delete;
+        ~graph_cache_entry() { ggml_backend_sched_snapshot_free(snap); }
+    };
+    std::vector<std::unique_ptr<graph_cache_entry>> gcache;
+    int      gcache_max        = 0; // 0 = off
+    uint32_t gcache_max_tokens = 16;
+    uint64_t gcache_tick       = 0;
+
+    void gcache_clear();
+
+    // [hostv] LLAMA_SYNC_SKIP_IDLE: true while this context may have submitted work that synchronize() did not wait for
+    bool sched_pending = true;
+    static bool graph_cacheable(const ggml_cgraph * gf);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

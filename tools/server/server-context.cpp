@@ -2965,6 +2965,14 @@ private:
     }
 
     void pre_decode() {
+        // [hostv] LLAMA_HOST_PROF: srv.pre.head = start of pre_decode .. drafting, srv.pre.tail = after drafting .. end
+        const int64_t hp_pre_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+        int64_t hp_pre_t1 = 0;
+        struct hp_pre_rec {
+            const int64_t & t1; const server_batch & b;
+            ~hp_pre_rec() { if (t1 && b.size() > 0 && b.size() <= 16) llama_hprof_record("srv.pre.tail", t1); }
+        } hp_pre_r { hp_pre_t1, batch };
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3084,7 +3092,7 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.prompt.tokens.get_text_tokens(slot.spec_prompt); // [hostv] in place
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -3105,6 +3113,10 @@ private:
             }
         });
 
+        if (hp_pre_t0 && !drafting.empty()) {
+            llama_hprof_record("srv.pre.head", hp_pre_t0);
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
@@ -3114,6 +3126,10 @@ private:
             if (hp_t0) {
                 llama_hprof_record("srv.spec_draft", hp_t0);
             }
+        }
+
+        if (hp_pre_t0 && !drafting.empty()) {
+            hp_pre_t1 = ggml_time_us();
         }
 
         // make checkpoints if needed
@@ -4095,7 +4111,16 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            {
+                const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (hp_t0) {
+                    llama_hprof_record("srv.post.seq_rm", hp_t0);
+                }
+            }
+
+            const int64_t hp_tok_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+            struct hp_tok_rec { int64_t t0; ~hp_tok_rec() { if (t0) llama_hprof_record("srv.post.process_tokens", t0); } } hp_tok_r { hp_tok_t0 };
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

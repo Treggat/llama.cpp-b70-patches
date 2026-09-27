@@ -284,6 +284,16 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        // [hostv] multi-graph reuse
+        const char * e_multi = getenv("LLAMA_GRAPH_REUSE_MULTI");
+        if (e_multi && atoi(e_multi) != 0 && !graph_reuse_disable) {
+            const char * e_max = getenv("LLAMA_GRAPH_REUSE_MULTI_MAX");
+            const char * e_tok = getenv("LLAMA_GRAPH_REUSE_MULTI_TOKENS");
+            gcache_max        = e_max ? std::max(1, atoi(e_max)) : 16;
+            gcache_max_tokens = e_tok ? (uint32_t) std::max(1, atoi(e_tok)) : 16u;
+            LLAMA_LOG_INFO("%s: multi-graph reuse: up to %d graphs of <= %u tokens\n", __func__, gcache_max, gcache_max_tokens);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -638,6 +648,7 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res.reset();
     }
+    gcache_clear();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
@@ -791,10 +802,28 @@ static void llama_hprof_add(const std::string & key, int64_t t0_us) {
     a.ms += (ggml_time_us() - t0_us) / 1000.0;
 }
 
+// [hostv] env LLAMA_SYNC_SKIP_IDLE=1 (default 0): llama_synchronize() on a context that has submitted no graph since its
+// last synchronize returns without waiting on its backends. All SYCL contexts of a device share one in-order queue,
+// so that wait also blocked on OTHER contexts' work: e.g. reading the target outputs (MTP process_h_rows,
+// common_sampler_sample on ctx_tgt) right after launching the MTP catch-up on ctx_dft waited for the whole catch-up
+// graph. The data read is the same: every output of this context was completed by its last real synchronize.
+static bool llama_sync_skip_idle() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SYNC_SKIP_IDLE");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+
+    if (llama_sync_skip_idle() && !sched_pending && n_queued_tokens == 0) {
+        return;
+    }
+    sched_pending = false;
 
     {
         const int64_t t0 = llama_hprof_mode() > 0 ? ggml_time_us() : 0;
@@ -907,6 +936,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
+        gcache_clear();
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
@@ -1433,14 +1463,62 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     int64_t hp_t0 = hprof ? ggml_time_us() : 0;
     bool hp_reused = false;
 
-    auto * res = get_gf_res_prev();
+    // [hostv] LLAMA_GRAPH_REUSE_MULTI: small ubatches use the multi-graph cache instead of gf_res_prev
+    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel;
+    graph_cache_entry * gce = nullptr;
+    bool gce_hit     = false;
+    bool hp_restored = false;
+
+    llm_graph_result * res = nullptr;
+    if (use_gcache) {
+        gcache_tick++;
+        // pass 0: the entry already loaded in the scheduler (plain reuse), pass 1: any other built entry (restore)
+        for (int pass = 0; pass < 2 && !gce; ++pass) {
+            for (auto & e : gcache) {
+                auto * r = e->res.get();
+                if ((pass == 0) != (gf_res_prev_active == r) || r->get_gf() == nullptr || ggml_graph_n_nodes(r->get_gf()) == 0) {
+                    continue;
+                }
+                if (!r->can_reuse(graph_params(r, ubatch, mctx, gtype))) {
+                    continue;
+                }
+                gce = e.get();
+                if (gf_res_prev_active == r) {
+                    gce_hit = true;
+                } else if (e->snap && ggml_backend_sched_snapshot_restore(sched.get(), e->snap)) {
+                    gf_res_prev_active = r;
+                    gce_hit     = true;
+                    hp_restored = true;
+                }
+                // else: no snapshot or stale (compute buffers reallocated) -> rebuild this entry in place
+                break;
+            }
+        }
+        if (!gce) {
+            if ((int) gcache.size() < gcache_max) {
+                gcache.emplace_back(new graph_cache_entry());
+                gcache.back()->res.reset(new llm_graph_result(graph_max_nodes(ubatch.n_tokens)));
+                gce = gcache.back().get();
+            } else {
+                for (auto & e : gcache) { // least recently used
+                    if (!gce || e->last_use < gce->last_use) {
+                        gce = e.get();
+                    }
+                }
+            }
+        }
+        gce->last_use = gcache_tick;
+        res = gce->res.get();
+    } else {
+        res = get_gf_res_prev();
+    }
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (use_gcache ? gce_hit : (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams))) {
         hp_reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1454,6 +1532,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        if (gce) {
+            // [hostv] the snapshot describes the graph that is about to be replaced: drop it first, so that a failed
+            // build/alloc below cannot leave a snapshot of freed tensors behind
+            ggml_backend_sched_snapshot_free(gce->snap);
+            gce->snap = nullptr;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1478,6 +1562,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        if (gce) {
+            gce->snap = graph_cacheable(gf) ? ggml_backend_sched_snapshot_new(sched.get()) : nullptr;
+        }
     }
 
     // set the input data for the input tensors
@@ -1486,7 +1574,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         if (hprof) {
-            llama_hprof_add(hp_tag + (hp_reused ? ".build_reuse" : ".build_alloc"), hp_t0);
+            llama_hprof_add(hp_tag + (hp_restored ? ".build_restore" : hp_reused ? ".build_reuse" : ".build_alloc"), hp_t0);
             hp_t0 = ggml_time_us();
         }
 
@@ -2478,6 +2566,38 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     return res;
 }
 
+void llama_context::gcache_clear() {
+    for (auto & e : gcache) {
+        if (gf_res_prev_active == e->res.get()) {
+            gf_res_prev_active = nullptr;
+        }
+    }
+    gcache.clear();
+}
+
+// [hostv] a graph can stay allocated next to others only if none of its compute tensors carries backend state that
+// the allocation of another graph resets (e.g. the SYCL buffer reset frees the extras of quantized tensors)
+bool llama_context::graph_cacheable(const ggml_cgraph * gf) {
+    auto bad = [](const ggml_tensor * t) {
+        return t && t->buffer && t->view_src == nullptr &&
+               ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               (ggml_is_quantized(t->type) || t->extra != nullptr);
+    };
+    ggml_cgraph * g = const_cast<ggml_cgraph *>(gf);
+    for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+        const ggml_tensor * t = ggml_graph_node(g, i);
+        if (bad(t)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (bad(t->src[j])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
@@ -2565,6 +2685,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
+    gcache_clear();
     gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
@@ -2648,6 +2769,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    sched_pending = true; // [hostv] LLAMA_SYNC_SKIP_IDLE
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3661,6 +3783,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            gcache_clear();
             gf_res_prev_active = nullptr;
             res->reset();
 
@@ -3692,6 +3815,7 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+            sched_pending = true; // [hostv] LLAMA_SYNC_SKIP_IDLE
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);

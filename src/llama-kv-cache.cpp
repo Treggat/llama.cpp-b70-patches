@@ -402,6 +402,22 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        // [hostv] env LLAMA_KV_SEQ_RM_FAST=1 (default 0): visit only the cells of seq_id with a position in [p0, p1)
+        // (from the per-sequence position set) instead of scanning every cell of the cache; the same cells are
+        // removed and the new head is the lowest freed cell, as in the scan
+        static const bool fast = [] {
+            const char * e = getenv("LLAMA_KV_SEQ_RM_FAST");
+            return e && atoi(e) != 0;
+        }();
+        if (fast) {
+            std::vector<uint32_t> idxs;
+            cells.seq_cells_range(seq_id, p0, p1, idxs);
+            for (const uint32_t i : idxs) {
+                if (cells.seq_rm(i, seq_id)) {
+                    new_head = std::min(new_head, i);
+                }
+            }
+        } else
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
@@ -1562,7 +1578,23 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    bool fast; // [hostv] LLAMA_KQ_MASK_FAST
 };
+
+// [hostv] env LLAMA_KQ_MASK_FAST=1 (default 0): build the first KQ-mask row of each sequence with one branch-free pass
+// over the cell positions when every used cell of the stream carries that sequence (the usual single-sequence
+// case), instead of testing the per-cell sequence bitsets (32 bytes per cell) cell by cell. Same mask bit for bit:
+// seq_has(j) == !is_empty(j) under that condition, M-RoPE 2D checks are applied to the few cells at position p1 and
+// the "cells near the batch" list comes from the per-sequence position set. LLAMA_KQ_MASK_FAST=2 also builds every
+// mask the reference way and aborts on any difference (test mode).
+static int llama_kq_mask_fast_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_FAST");
+        return e ? atoi(e) : 0;
+    }();
+    return mode;
+}
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
@@ -1638,6 +1670,28 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                     seq_srct[seq_id] = i;
                 }
+            }
+
+            // [hostv] LLAMA_KQ_MASK_FAST: first row of this sequence in one branch-free pass
+            if (causal && !swa && !alibi && !prev && args.fast && cells.get_used() == cells.seq_n_cells(seq_id)) {
+                const llama_pos * P = cells.pos_data();
+                const uint32_t up1 = (uint32_t) p1; // empty cells have pos -1 -> 0xffffffff > p1
+                T * row = data + idst;
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    row[j] = (uint32_t) P[j] <= up1 ? mask_keep : mask_drop;
+                }
+                const llama_pos p_near = seq_pos_min[seq_id] - (llama_pos) (n_swa + 32);
+                cells.seq_cells_from(seq_id, p_near, [&](llama_pos pc, uint32_t j) {
+                    if ((int64_t) j >= n_kv) {
+                        return;
+                    }
+                    idxs.push_back(j);
+                    if (is_2d && pc == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                        row[j] = mask_drop;
+                    }
+                });
+                GGML_UNUSED(p0);
+                continue;
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -1786,12 +1840,33 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.fast             =*/ llama_kq_mask_fast_mode() > 0,
     };
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    if (llama_kq_mask_fast_mode() == 2) {
+        // test mode: rebuild with the reference path and compare bit for bit
+        std::vector<uint8_t> ref(ggml_nbytes(dst));
+        args_set_input_kq_mask args_ref = args;
+        args_ref.fast = false;
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args_ref, (ggml_fp16_t *) ref.data(), causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args_ref, (float *) ref.data(), causal_attn);
+        }
+        static int64_t n_checked = 0;
+        n_checked++;
+        if (memcmp(ref.data(), dst->data, ref.size()) != 0) {
+            GGML_ABORT("LLAMA_KQ_MASK_FAST mismatch (n_kv = %lld, n_tokens = %u, check #%lld)", (long long) n_kv, n_tokens, (long long) n_checked);
+        }
+        if ((n_checked & (n_checked - 1)) == 0) {
+            LLAMA_LOG_INFO("%s: LLAMA_KQ_MASK_FAST=2: %lld masks identical so far (n_kv = %lld)\n", __func__, (long long) n_checked, (long long) n_kv);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

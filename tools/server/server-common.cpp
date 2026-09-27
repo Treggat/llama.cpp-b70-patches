@@ -645,6 +645,16 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
+void server_tokens::get_text_tokens(llama_tokens & out) const {
+    out.clear();
+    out.reserve(tokens.size());
+    for (llama_token t : tokens) {
+        if (t != LLAMA_TOKEN_NULL) {
+            out.push_back(t);
+        }
+    }
+}
+
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;

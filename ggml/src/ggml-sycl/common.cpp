@@ -134,6 +134,7 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
 }
 
 std::atomic<uint64_t> g_ggml_sycl_mem_epoch{0};
+std::atomic<uint64_t> g_ggml_sycl_opt_epoch{0};
 bool g_ggml_sycl_graph_recording = false;
 
 void ggml_sycl_free_device(void *ptr, sycl::queue &q) {

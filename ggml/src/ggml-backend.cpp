@@ -2261,6 +2261,145 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
     return sched->backends[backend_index];
 }
 
+// ---- [hostv] scheduler snapshots (llama LLAMA_GRAPH_REUSE_MULTI) ----
+// A snapshot captures everything ggml_backend_sched_compute_splits (and ggml_backend_sched_get_tensor_backend) read for
+// the graph of the last ggml_backend_sched_alloc_graph: the splits with their inputs, the used hash slots (tensor ->
+// backend id and split-input copies) and the bytes of the scheduler context that hold the split-input copy tensors
+// the graph nodes point to. Restoring it makes that graph computable again without splitting or allocating it, while
+// its tensors still own their offsets in the compute buffers. Graph tensors are not copied: their data pointers stay
+// valid as long as the gallocr did not reallocate a compute buffer, which the realloc counter checks. The caller must
+// not restore a snapshot whose graph was rebuilt, freed or re-allocated in the meantime.
+struct ggml_backend_sched_snapshot {
+    ggml_backend_sched_t sched = nullptr;
+    uint64_t             n_realloc = 0;
+
+    std::vector<char> ctx_bytes;
+
+    struct split_t {
+        int backend_id, i_start, i_end;
+        std::vector<ggml_tensor *> inputs;
+        ggml_cgraph graph;
+    };
+    std::vector<split_t> splits;
+    std::vector<ggml_tensor *> graph_inputs;
+
+    // used hash slots
+    std::vector<uint32_t>      slot_idx;
+    std::vector<ggml_tensor *> slot_key;
+    std::vector<int>           slot_backend;
+    std::vector<ggml_tensor *> slot_copies; // [n_slots][n_backends*n_copies]
+};
+
+ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_new(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->is_alloc || sched->n_copies != 1 || sched->ctx == NULL) {
+        return NULL;
+    }
+    auto * snap = new ggml_backend_sched_snapshot();
+    snap->sched     = sched;
+    snap->n_realloc = ggml_gallocr_get_n_realloc(sched->galloc);
+
+    const size_t used = ggml_used_mem(sched->ctx);
+    GGML_ASSERT(used <= sched->context_buffer_size);
+    snap->ctx_bytes.assign(sched->context_buffer, sched->context_buffer + used);
+
+    snap->splits.resize(sched->n_splits);
+    for (int i = 0; i < sched->n_splits; i++) {
+        const auto & s = sched->splits[i];
+        auto & d = snap->splits[i];
+        d.backend_id = s.backend_id;
+        d.i_start    = s.i_start;
+        d.i_end      = s.i_end;
+        d.inputs.assign(s.inputs, s.inputs + s.n_inputs);
+        d.graph      = s.graph;
+    }
+    snap->graph_inputs.assign(sched->graph_inputs, sched->graph_inputs + sched->n_graph_inputs);
+
+    const int nbc = sched->n_backends * sched->n_copies;
+    const size_t n_words = ggml_bitset_size(sched->hash_set.size);
+    for (size_t w = 0; w < n_words; w++) {
+        const ggml_bitset_t bits = sched->hash_set.used[w];
+        for (int b = 0; bits != 0 && b < (int) (sizeof(ggml_bitset_t)*8); b++) {
+            if (!((bits >> b) & 1u)) {
+                continue;
+            }
+            const size_t id = (w << BITSET_SHR) + b;
+            snap->slot_idx.push_back((uint32_t) id);
+            snap->slot_key.push_back(sched->hash_set.keys[id]);
+            snap->slot_backend.push_back(sched->hv_tensor_backend_ids[id]);
+            snap->slot_copies.insert(snap->slot_copies.end(), sched->hv_tensor_copies + id*nbc, sched->hv_tensor_copies + (id + 1)*nbc);
+        }
+    }
+    return snap;
+}
+
+bool ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
+    GGML_ASSERT(sched && snap && snap->sched == sched);
+    if (snap->n_realloc != ggml_gallocr_get_n_realloc(sched->galloc) || sched->n_copies != 1) {
+        return false;
+    }
+
+    // the split-input copy tensors at their original addresses in the scheduler context buffer
+    // (the context object itself keeps describing the last split; the next split frees and re-inits it)
+    memcpy(sched->context_buffer, snap->ctx_bytes.data(), snap->ctx_bytes.size());
+
+    // splits
+    const int n_splits = (int) snap->splits.size();
+    if (n_splits > sched->splits_capacity) {
+        auto * pnew = (ggml_backend_sched_split *) realloc(sched->splits, n_splits * sizeof(sched->splits[0]));
+        GGML_ASSERT(pnew != NULL);
+        memset(pnew + sched->splits_capacity, 0, (n_splits - sched->splits_capacity) * sizeof(sched->splits[0]));
+        sched->splits = pnew;
+        sched->splits_capacity = n_splits;
+    }
+    for (int i = 0; i < n_splits; i++) {
+        const auto & s = snap->splits[i];
+        auto & d = sched->splits[i];
+        while (d.inputs_capacity < (int) s.inputs.size()) {
+            ggml_backend_sched_split_inputs_grow(&d);
+        }
+        d.backend_id = s.backend_id;
+        d.i_start    = s.i_start;
+        d.i_end      = s.i_end;
+        d.n_inputs   = (int) s.inputs.size();
+        if (d.n_inputs > 0) {
+            memcpy(d.inputs, s.inputs.data(), d.n_inputs * sizeof(d.inputs[0]));
+        }
+        d.graph = s.graph;
+    }
+    sched->n_splits = n_splits;
+
+    while (sched->graph_inputs_capacity < (int) snap->graph_inputs.size()) {
+        ggml_backend_sched_graph_inputs_grow(sched);
+    }
+    sched->n_graph_inputs = (int) snap->graph_inputs.size();
+    if (sched->n_graph_inputs > 0) {
+        memcpy(sched->graph_inputs, snap->graph_inputs.data(), sched->n_graph_inputs * sizeof(sched->graph_inputs[0]));
+    }
+
+    // hash: only the snapshot's slots are marked used again; stale values in the other slots are never read for the
+    // tensors of this graph (linear probing only walks used slots), and the next ggml_backend_sched_reset clears all
+    ggml_hash_set_reset(&sched->hash_set);
+    const int nbc = sched->n_backends * sched->n_copies;
+    for (size_t k = 0; k < snap->slot_idx.size(); k++) {
+        const size_t id = snap->slot_idx[k];
+        ggml_bitset_set(sched->hash_set.used, id);
+        sched->hash_set.keys[id]          = snap->slot_key[k];
+        sched->hv_tensor_backend_ids[id]  = snap->slot_backend[k];
+        memcpy(sched->hv_tensor_copies + id*nbc, snap->slot_copies.data() + k*nbc, nbc * sizeof(ggml_tensor *));
+    }
+
+    sched->cur_copy  = 0;
+    sched->next_copy = 0;
+    sched->is_reset  = false;
+    sched->is_alloc  = true;
+    return true;
+}
+
+void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap) {
+    delete snap;
+}
+
 // utils
 
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {

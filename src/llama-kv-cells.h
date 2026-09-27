@@ -86,6 +86,31 @@ public:
         return used.size();
     }
 
+    // [hostv] fast KQ-mask support
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
+    // number of cells that carry sequence seq_id (== get_used() iff every used cell carries it)
+    size_t seq_n_cells(llama_seq_id seq_id) const {
+        return seq_pos[seq_id].size();
+    }
+
+    // call f(pos, cell) for every cell of seq_id with position >= p_min, in (pos, cell) order
+    template <typename F>
+    void seq_cells_from(llama_seq_id seq_id, llama_pos p_min, F && f) const {
+        for (auto it = seq_pos[seq_id].lower_bound({ p_min, 0u }); it != seq_pos[seq_id].end(); ++it) {
+            f(it->first, it->second);
+        }
+    }
+
+    // append the cells of seq_id with position in [p0, p1) to out
+    void seq_cells_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
+        for (auto it = seq_pos[seq_id].lower_bound({ p0, 0u }); it != seq_pos[seq_id].end() && it->first < p1; ++it) {
+            out.push_back(it->second);
+        }
+    }
+
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {

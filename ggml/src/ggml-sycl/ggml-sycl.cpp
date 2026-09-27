@@ -4764,6 +4764,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
     if (reorder_qw(src0, ctx->stream())) {
         extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
+        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv] invalidates memoized graph signatures
     }
 }
 
@@ -4781,6 +4782,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     }
     if (reorder_qw(src0, ctx->stream())) {
         extra->optimized_feature.reorder = true;
+        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
     }
 }
 
@@ -6959,6 +6961,13 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 //                                 vision encoder) always run eagerly: they are GPU-bound, and it keeps
 //                                 graph recording to the decode / draft / verify graphs the tests cover
 //   GGML_SYCL_GRAPH_STATS=N       print counters every N graph_compute calls and at exit (0 = off)
+//   GGML_SYCL_GRAPH_RECORD_AHEAD=0 [hostv] 1: record + finalize a new signature right after its (last) warmup eager
+//                                 submission, while the GPU still runs it, instead of at its next call with the GPU
+//                                 idle (the next call replays; same commands, same pointers -> same results)
+//   GGML_SYCL_GRAPH_SIG_MEMO=0    [hostv] 1: reuse the signature of a split graph that the scheduler did not re-split
+//                                 or re-allocate (same graph uid, node array, node count, no weight reorder and no
+//                                 device free since) instead of hashing all nodes again; 2: also hash and abort on
+//                                 any difference (test mode)
 //   GGML_SYCL_GRAPH_SELFTEST=1    test hook: eager run, poison node outputs with 0xFF, record, replay
 //                                 (so test-backend-ops compares the REPLAYED result against the CPU);
 //                                 =2 is the harness's negative control (records but never replays)
@@ -6972,6 +6981,8 @@ struct ggml_sycl_graph_cfg {
     int max_tokens = 32;
     int stats     = 0;
     int selftest  = 0;
+    int record_ahead = 0; // [hostv]
+    int sig_memo     = 0; // [hostv]
 };
 
 static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
@@ -6984,9 +6995,11 @@ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
         c.max_tokens = std::max(1, ggml_sycl_get_env("GGML_SYCL_GRAPH_MAX_TOKENS", 32));
         c.stats     = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_STATS", 0));
         c.selftest  = ggml_sycl_get_env("GGML_SYCL_GRAPH_SELFTEST", 0);
+        c.record_ahead = ggml_sycl_get_env("GGML_SYCL_GRAPH_RECORD_AHEAD", 0);
+        c.sig_memo     = ggml_sycl_get_env("GGML_SYCL_GRAPH_SIG_MEMO", 0);
         if (g_ggml_sycl_enable_graph) {
-            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d\n",
-                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest);
+            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d\n",
+                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo);
         }
         return c;
     }();
@@ -7048,6 +7061,7 @@ static double   g_gstat_sig_us = 0;
 // LOCAL: host time per path (stats on only): eager submit, record (queue capture), finalize, replay submit
 static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
 static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
+static uint64_t g_gstat_record_ahead = 0, g_gstat_record_ahead_fail = 0, g_gstat_memo_hit = 0, g_gstat_memo_checked = 0; // [hostv]
 
 // ---- [spechost] GGML_SYCL_GRAPH_MISSLOG=N: explain why a graph got a NEW cache signature (eager/record instead of
 // replay). For every new signature it compares the graph node by node with the previous graph of the same shape class
@@ -7183,6 +7197,11 @@ static void ggml_sycl_graph_stats_print() {
                   (unsigned long long) g_gstat_eager, (unsigned long long) g_gstat_fail,
                   (unsigned long long) g_gstat_flush, (unsigned long long) g_gstat_evict,
                   (unsigned long long) g_gstat_selftest_skip, n ? g_gstat_sig_us / n : 0.0);
+    if (ggml_sycl_graph_config().record_ahead || ggml_sycl_graph_config().sig_memo) {
+        fprintf(stderr, "[SYCL-GRAPH] hostv: record_ahead=%llu record_ahead_fail=%llu sig_memo_hit=%llu sig_memo_checked=%llu\n",
+                (unsigned long long) g_gstat_record_ahead, (unsigned long long) g_gstat_record_ahead_fail,
+                (unsigned long long) g_gstat_memo_hit, (unsigned long long) g_gstat_memo_checked);
+    }
     fprintf(stderr, "[SYCL-GRAPH] host ms/call: eager=%.3f record=%.3f finalize=%.3f replay=%.3f\n",
                   g_gstat_n_eager_timed ? g_gstat_t_eager_us / g_gstat_n_eager_timed / 1e3 : 0.0,
                   g_gstat_record ? g_gstat_t_record_us / g_gstat_record / 1e3 : 0.0,
@@ -7355,12 +7374,41 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
     }
 
     uint64_t h1, h2;
-    if (cfg.stats > 0) {
-        const auto t0 = std::chrono::steady_clock::now();
-        ggml_sycl_graph_signature(cgraph, h1, h2);
-        g_gstat_sig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-    } else {
-        ggml_sycl_graph_signature(cgraph, h1, h2);
+    {
+        const auto t0 = cfg.stats > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // [hostv] GGML_SYCL_GRAPH_SIG_MEMO: a split graph that was not re-split / re-allocated keeps its uid, node
+        // array and tensor pointers; weight reorders and device frees bump the epochs that are part of the key
+        const uint64_t opt_epoch = g_ggml_sycl_opt_epoch.load(std::memory_order_relaxed);
+        ggml_backend_sycl_context::sig_memo_entry * me = nullptr;
+        bool have = false;
+        if (cfg.sig_memo > 0 && cgraph->uid != 0) {
+            if (ctx->sig_memo.size() > 4096) {
+                ctx->sig_memo.clear();
+            }
+            me = &ctx->sig_memo[cgraph->uid];
+            have = me->nodes == cgraph->nodes && me->n_nodes == cgraph->n_nodes && me->opt_epoch == opt_epoch &&
+                   me->mem_epoch == epoch && me->valid;
+        }
+        if (have && cfg.sig_memo == 1) {
+            h1 = me->h1;
+            h2 = me->h2;
+            g_gstat_memo_hit++;
+        } else {
+            ggml_sycl_graph_signature(cgraph, h1, h2);
+            if (have) {
+                g_gstat_memo_checked++;
+                if (me->h1 != h1 || me->h2 != h2) {
+                    GGML_ABORT("[SYCL-GRAPH] GGML_SYCL_GRAPH_SIG_MEMO=2: memoized signature differs (uid %llu, %d nodes)",
+                               (unsigned long long) cgraph->uid, cgraph->n_nodes);
+                }
+            }
+            if (me) {
+                *me = { cgraph->nodes, cgraph->n_nodes, opt_epoch, epoch, h1, h2, true };
+            }
+        }
+        if (cfg.stats > 0) {
+            g_gstat_sig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
     }
 
     auto it = ctx->graph_cache.find(h1);
@@ -7403,6 +7451,20 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
             }
             // fall through: record + replay the same graph now
         } else {
+            // [hostv] GGML_SYCL_GRAPH_RECORD_AHEAD: record + finalize now, while the GPU runs the eager submission,
+            // instead of at the next call; that call then replays
+            if (cfg.record_ahead > 0 && !e.no_graph && e.seen >= cfg.warmup) {
+                auto exec = ggml_sycl_graph_record(ctx, cgraph);
+                if (exec) {
+                    g_gstat_record++;
+                    g_gstat_record_ahead++;
+                    e.exec = std::move(exec);
+                } else {
+                    // e.g. an op depends on an event of the still running eager submission (oneDNN): not a
+                    // failure of the graph, the next call records it the regular way
+                    g_gstat_record_ahead_fail++;
+                }
+            }
             ggml_sycl_graph_cache_evict(ctx, (size_t) cfg.max);
             return;
         }

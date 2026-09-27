@@ -189,6 +189,7 @@ bool ggml_sycl_dnn_u4_prepare(ggml_backend_sycl_context & ctx, const ggml_tensor
     extra->dnn_mins                 = mn_dev;
     extra->dnn_scales_device        = ctx.device;
     extra->optimized_feature.dnn_u4 = true;
+    g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
     return true;
 }
 

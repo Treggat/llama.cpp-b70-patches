@@ -1681,6 +1681,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        const int64_t hp_prep_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [hostv] mtp.catchup_prep
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
@@ -1737,6 +1738,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                if (hp_prep_t0 && head == 0 && batch.n_tokens <= 16) {
+                    llama_hprof_record("mtp.catchup_prep", hp_prep_t0);
+                }
                 const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (hp_t0) {
