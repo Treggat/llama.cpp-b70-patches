@@ -1252,7 +1252,16 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LOCAL: LLAMA_KV_PAD=N (multiple of 256, default off) coarsens the n_kv buckets further. Every n_kv value is a
+    // distinct compute graph, so a backend that caches recorded graphs (SYCL GGML_SYCL_ENABLE_GRAPH) re-records every
+    // decode / draft / verify graph each time the context crosses a bucket boundary; fewer, larger buckets trade a few
+    // masked KV columns for fewer re-recordings.
+    static const uint32_t env_pad = [] {
+        const char * e = getenv("LLAMA_KV_PAD");
+        const long   v = e && *e ? atol(e) : 0;
+        return v > 256 ? (uint32_t) GGML_PAD(v, 256) : 0u;
+    }();
+    const uint32_t n_pad_cur = std::max(std::max(n_pad, 256u), env_pad);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

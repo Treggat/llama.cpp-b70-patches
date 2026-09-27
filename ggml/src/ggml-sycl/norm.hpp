@@ -25,6 +25,10 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tens
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul_tensor, ggml_tensor* add_tensor);
 
+// LOCAL (GGML_SYCL_GDN_FUSE): mul2 = (rms_norm(x) * w) * silu(z) in one launch
+void ggml_sycl_op_rms_norm_mul_silu_gate(ggml_backend_sycl_context& ctx, ggml_tensor* rms_norm, ggml_tensor* mul1,
+                                         ggml_tensor* silu, ggml_tensor* mul2);
+
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);

@@ -4857,10 +4857,19 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    // LOCAL: small-row q4_K / q6_K weights (e.g. 48 x 5120 ssm_alpha/beta, 1024 x 5120 attn_k/v) at 2..8 columns stay
+    // on MMVQ, which then runs the split-K kernel (mmvq.cpp, GGML_SYCL_SMALLROW=1): the XMX kernels have 16 rows per
+    // sub-group and leave the device idle on these shapes (3 / 64 sub-groups)
+    const bool smallrow = !split && dst->op == GGML_OP_MUL_MAT && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv &&
+                          ggml_sycl_supports_reorder_mmvq(src0->type) && ggml_is_contiguous(src0) &&
+                          src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                          ggml_sycl_smallrow_can_use(src0->type, src0->ne[1], src1->ne[1]) &&
+                          !ggml_sycl_dnn_u4_is_repacked(src0);
+
     // q4_K x 3..16 columns (env window) on the XMX matrix units (mmq-xmx-q4k.cpp): reads the MMVQ reorder layout in place and
     // quantizes the activations exactly as MMVQ's q8_1 quantizer does, so it coexists with MMVQ (1 column) and every
     // reorder-aware path. Default off (GGML_SYCL_XMX_Q4K=1); exclusive with the oneDNN u4 repack.
-    if (!split && ggml_sycl_xmx_q4k_can_use(ctx, src0, src1, dst)) {
+    if (!split && !smallrow && ggml_sycl_xmx_q4k_can_use(ctx, src0, src1, dst)) {
         // the same reorder the MMVQ branch below installs (a no-op once done), not a new repack; installed here
         // whatever the column count, since should_reorder_tensor() stops at 8 and this path serves up to 16
         opt_for_reorder_id(&ctx, src0);
@@ -4881,7 +4890,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // q6_K x 3..8 columns on the XMX matrix units (mmq-xmx-q6k.cpp): same scheme as q4_K above (MMVQ reorder layout
     // read in place, the same SoA q8_1 activations); small weights stay on MMVQ (can_use's minimum-work guards).
     // Default off (GGML_SYCL_XMX_Q6K=1).
-    if (!split && ggml_sycl_xmx_q6k_can_use(ctx, src0, src1, dst)) {
+    if (!split && !smallrow && ggml_sycl_xmx_q6k_can_use(ctx, src0, src1, dst)) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
@@ -6241,6 +6250,309 @@ static void ggml_sycl_op_prof_graph_end() {
     }
 }
 
+// ---- LOCAL: qwen35 gated-delta layer fusions (GGML_SYCL_GDN_FUSE=1, default off) ----
+// The small ops around a gated-delta layer's GATED_DELTA_NET, each a separate ~3 us launch unfused:
+//   G: RMS_NORM -> MUL(w) -> [view] SILU(z) -> MUL          (build_norm_gated)        4 ops -> 1 launch
+//   A: ADD(x, ssm_dt) -> SOFTPLUS -> MUL(ssm_a)              (alpha -> gate)           3 ops -> 1 launch
+//   M (also needs GGML_SYCL_SMALLROW=1): the ssm_alpha / ssm_beta MUL_MAT (48 rows) with its epilogue in the split-K
+//      MMVQ kernel: MUL_MAT -> [reshape] SIGMOID, or MUL_MAT -> [reshape] ADD -> SOFTPLUS -> MUL (quantize + 1 launch)
+// Every fused kernel performs the unfused nodes' float operations in the same order; only the matmul's partial-sum
+// order differs from the unfused matmul path (split-K vs the XMX / MMVQ kernels).
+static bool ggml_sycl_gdn_fuse_enabled() {
+    static const bool v = ggml_sycl_get_env("GGML_SYCL_GDN_FUSE", 0) != 0;
+    return v;
+}
+
+static void ggml_sycl_gdn_fuse_note(int kind) {
+    static const char * names[] = { "norm*silu gate", "add+softplus+mul", "mul_mat+sigmoid", "mul_mat+add+softplus+mul",
+                                    "dual (alpha+beta) split-K launch" };
+    static bool         seen[5] = {};
+    if (!seen[kind]) {
+        seen[kind] = true;
+        GGML_LOG_INFO("[SYCL-GDN-FUSE] %s fusion active\n", names[kind]);
+    }
+}
+
+static int32_t ggml_sycl_gdn_use_count(const ggml_cgraph * cg, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cg->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cg->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cg->use_counts[pos];
+}
+
+// an intermediate the fused kernel does not write: exactly one consumer and not a graph output
+static bool ggml_sycl_gdn_internal(const ggml_cgraph * cg, const ggml_tensor * t) {
+    return ggml_sycl_gdn_use_count(cg, t) == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+}
+
+// next node after idx that does work (views and no-ops skipped), or -1
+static int ggml_sycl_gdn_next(const ggml_cgraph * cg, int idx) {
+    for (int j = idx + 1; j < cg->n_nodes; ++j) {
+        const ggml_tensor * n = cg->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        return j;
+    }
+    return -1;
+}
+
+// does `s` reach `root` through zero or more offset-0, contiguous, single-use RESHAPE / VIEW nodes?
+static bool ggml_sycl_gdn_is_view_of(const ggml_cgraph * cg, const ggml_tensor * s, const ggml_tensor * root) {
+    while (s != root) {
+        if (s == nullptr || (s->op != GGML_OP_RESHAPE && s->op != GGML_OP_VIEW) || s->view_offs != 0 ||
+            !ggml_is_contiguous(s) || !ggml_sycl_gdn_internal(cg, s)) {
+            return false;
+        }
+        s = s->src[0];
+    }
+    return true;
+}
+
+static bool ggml_sycl_gdn_f32c(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+}
+
+// a one-row broadcast operand (ssm_dt, ssm_a, a norm weight): n contiguous floats
+static bool ggml_sycl_gdn_row_vec(const ggml_tensor * t, int64_t n) {
+    return ggml_sycl_gdn_f32c(t) && t->ne[0] == n && ggml_nelements(t) == n;
+}
+
+// ADD(x, b) -> SOFTPLUS -> MUL(., a) starting at add_idx, with x = `x_root` reached through views when x_root is set.
+// Returns the MUL node index, or -1.
+static int ggml_sycl_gdn_match_alpha(const ggml_cgraph * cg, int add_idx, const ggml_tensor * x_root,
+                                     const ggml_tensor ** b_out, const ggml_tensor ** a_out) {
+    const ggml_tensor * add = cg->nodes[add_idx];
+    if (add->op != GGML_OP_ADD || !ggml_sycl_gdn_f32c(add) || !ggml_sycl_gdn_internal(cg, add)) {
+        return -1;
+    }
+    const int64_t n0 = add->ne[0];
+    const ggml_tensor * x = nullptr;
+    const ggml_tensor * b = nullptr;
+    for (int k = 0; k < 2; ++k) {
+        const ggml_tensor * s = add->src[k];
+        const ggml_tensor * o = add->src[1 - k];
+        const bool x_ok = x_root ? ggml_sycl_gdn_is_view_of(cg, s, x_root)
+                                 : (ggml_sycl_gdn_f32c(s) && ggml_are_same_shape(s, add));
+        if (x_ok && ggml_sycl_gdn_row_vec(o, n0) && ggml_nelements(s) == ggml_nelements(add)) {
+            x = s;
+            b = o;
+            break;
+        }
+    }
+    if (!x) {
+        return -1;
+    }
+    const int sp_idx = ggml_sycl_gdn_next(cg, add_idx);
+    if (sp_idx < 0) {
+        return -1;
+    }
+    const ggml_tensor * sp = cg->nodes[sp_idx];
+    if (sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || sp->src[0] != add ||
+        !ggml_sycl_gdn_f32c(sp) || !ggml_are_same_shape(sp, add) || !ggml_sycl_gdn_internal(cg, sp)) {
+        return -1;
+    }
+    const int mul_idx = ggml_sycl_gdn_next(cg, sp_idx);
+    if (mul_idx < 0) {
+        return -1;
+    }
+    const ggml_tensor * mul = cg->nodes[mul_idx];
+    if (mul->op != GGML_OP_MUL || !ggml_sycl_gdn_f32c(mul) || !ggml_are_same_shape(mul, add)) {
+        return -1;
+    }
+    const ggml_tensor * a = mul->src[0] == sp ? mul->src[1] : (mul->src[1] == sp ? mul->src[0] : nullptr);
+    if (!a || !ggml_sycl_gdn_row_vec(a, n0)) {
+        return -1;
+    }
+    *b_out = b;
+    *a_out = a;
+    return mul_idx;
+}
+
+// GGML_SYCL_GDN_FUSE_DUAL=0: fuse ssm_alpha / ssm_beta each on its own (no shared launch)
+static bool ggml_sycl_gdn_no_dual() {
+    static const bool v = ggml_sycl_get_env("GGML_SYCL_GDN_FUSE_DUAL", 1) == 0;
+    return v;
+}
+
+// MUL_MAT at mm_idx (small-row q4_K / q6_K) followed by [views] SIGMOID, or [views] ADD -> SOFTPLUS -> MUL.
+// Installs the reorder layout the split-K kernel reads. Returns the last fused node index (out / ep set), or -1.
+static int ggml_sycl_gdn_match_mm(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int mm_idx,
+                                  ggml_tensor ** out, ggml_sycl_mmvq_epilogue * ep) {
+    ggml_tensor *       node = cg->nodes[mm_idx];
+    const ggml_tensor * w    = node->src[0];
+    const ggml_tensor * act  = node->src[1];
+    if (ggml_backend_buffer_is_sycl_split(w->buffer) || g_ggml_sycl_prioritize_dmmv || ggml_sycl_dnn_u4_enabled() ||
+        ggml_sycl_dnn_u4_is_repacked(w) || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 ||
+        !ggml_sycl_gdn_f32c(act) || act->ne[2] != 1 || act->ne[3] != 1 || !ggml_sycl_gdn_f32c(node) ||
+        !ggml_sycl_smallrow_shape_ok(w->type, w->ne[1], w->ne[0], act->ne[1]) || !ggml_sycl_gdn_internal(cg, node)) {
+        return -1;
+    }
+    const int64_t nrows = w->ne[1];
+    const int     j1    = ggml_sycl_gdn_next(cg, mm_idx);
+    if (j1 < 0) {
+        return -1;
+    }
+    int                 last = -1;
+    const ggml_tensor * n1   = cg->nodes[j1];
+    if (n1->op == GGML_OP_UNARY && ggml_get_unary_op(n1) == GGML_UNARY_OP_SIGMOID &&
+        ggml_sycl_gdn_is_view_of(cg, n1->src[0], node) && ggml_sycl_gdn_f32c(n1) &&
+        ggml_nelements(n1) == ggml_nelements(node)) {
+        *ep      = ggml_sycl_mmvq_epilogue{};
+        ep->op   = 1;
+        *out     = cg->nodes[j1];
+        last     = j1;
+    } else if (n1->op == GGML_OP_ADD) {
+        const ggml_tensor * b = nullptr;
+        const ggml_tensor * a = nullptr;
+        const int           j = ggml_sycl_gdn_match_alpha(cg, j1, node, &b, &a);
+        if (j < 0 || n1->ne[0] != nrows) {
+            return -1;
+        }
+        *ep   = ggml_sycl_mmvq_epilogue{};
+        ep->op = 2;
+        ep->b  = (const float *) b->data;
+        ep->a  = (const float *) a->data;
+        *out   = cg->nodes[j];
+        last   = j;
+    } else {
+        return -1;
+    }
+
+    opt_for_reorder(&ctx, w, act, node, mul_mat_algo::MMVQ);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+    if (!extra || !extra->optimized_feature.reorder) {
+        return -1;
+    }
+    return last;
+}
+
+// returns the index of the last fused node, or -1 (nothing done)
+static int ggml_sycl_gdn_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cg, int i) {
+    ggml_tensor * node = cg->nodes[i];
+
+    // G: RMS_NORM -> MUL(w) -> SILU(z) -> MUL
+    if (node->op == GGML_OP_RMS_NORM) {
+        const ggml_tensor * x = node->src[0];
+        if (x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) ||
+            !ggml_sycl_gdn_internal(cg, node)) {
+            return -1;
+        }
+        const int j1 = ggml_sycl_gdn_next(cg, i);
+        if (j1 < 0) {
+            return -1;
+        }
+        ggml_tensor * mul1 = cg->nodes[j1];
+        if (mul1->op != GGML_OP_MUL || mul1->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul1, node) ||
+            !ggml_sycl_gdn_internal(cg, mul1)) {
+            return -1;
+        }
+        const ggml_tensor * w = mul1->src[0] == node ? mul1->src[1] : (mul1->src[1] == node ? mul1->src[0] : nullptr);
+        if (!w || !ggml_sycl_gdn_row_vec(w, node->ne[0])) {
+            return -1;
+        }
+        const int j2 = ggml_sycl_gdn_next(cg, j1);
+        if (j2 < 0) {
+            return -1;
+        }
+        ggml_tensor * silu = cg->nodes[j2];
+        if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(silu, node) || !ggml_sycl_gdn_internal(cg, silu)) {
+            return -1;
+        }
+        const ggml_tensor * z = silu->src[0];
+        if (z->type != GGML_TYPE_F32 || z->nb[0] != sizeof(float) || !ggml_are_same_shape(z, node)) {
+            return -1;
+        }
+        const int j3 = ggml_sycl_gdn_next(cg, j2);
+        if (j3 < 0) {
+            return -1;
+        }
+        ggml_tensor * mul2 = cg->nodes[j3];
+        if (mul2->op != GGML_OP_MUL || mul2->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul2, node) ||
+            mul2->nb[0] != sizeof(float) ||
+            !((mul2->src[0] == mul1 && mul2->src[1] == silu) || (mul2->src[0] == silu && mul2->src[1] == mul1))) {
+            return -1;
+        }
+        ggml_sycl_op_rms_norm_mul_silu_gate(ctx, node, mul1, silu, mul2);
+        ggml_sycl_gdn_fuse_note(0);
+        return j3;
+    }
+
+    // A: ADD -> SOFTPLUS -> MUL (the matmul in front ran on its own)
+    if (node->op == GGML_OP_ADD) {
+        const ggml_tensor * b = nullptr;
+        const ggml_tensor * a = nullptr;
+        const int j = ggml_sycl_gdn_match_alpha(cg, i, nullptr, &b, &a);
+        if (j < 0) {
+            return -1;
+        }
+        ggml_sycl_op_add_softplus_mul_fused(ctx, node, cg->nodes[ggml_sycl_gdn_next(cg, i)], cg->nodes[j]);
+        ggml_sycl_gdn_fuse_note(1);
+        return j;
+    }
+
+    // M: small-row MUL_MAT + epilogue on the split-K kernel; two such matmuls in a row over the same activations
+    // (ssm_alpha's chain, then ssm_beta's) share one quantization and one launch
+    if (node->op == GGML_OP_MUL_MAT && ggml_sycl_smallrow_enabled()) {
+        ggml_tensor *           out0 = nullptr;
+        ggml_sycl_mmvq_epilogue ep0;
+        const int last0 = ggml_sycl_gdn_match_mm(ctx, cg, i, &out0, &ep0);
+        if (last0 < 0) {
+            return -1;
+        }
+        const ggml_tensor * w0  = node->src[0];
+        const ggml_tensor * act = node->src[1];
+
+        // the second matmul: next working node, same activations, same weight type and shape
+        ggml_tensor *           out1  = nullptr;
+        ggml_sycl_mmvq_epilogue ep1;
+        int                     last1 = -1;
+        const int               i1    = ggml_sycl_gdn_next(cg, last0);
+        if (i1 > 0 && !ggml_sycl_gdn_no_dual()) {
+            const ggml_tensor * m1 = cg->nodes[i1];
+            if (m1->op == GGML_OP_MUL_MAT && m1->src[1] == act && m1->src[0]->type == w0->type &&
+                ggml_are_same_shape(m1->src[0], w0) && ggml_are_same_shape(m1, node)) {
+                last1 = ggml_sycl_gdn_match_mm(ctx, cg, i1, &out1, &ep1);
+            }
+        }
+
+        scope_op_debug_print scope_dbg_print(__func__, node, /*num_src=*/2, " : fused with its epilogue (split-K)");
+        const int64_t   ne00             = w0->ne[0];
+        const int64_t   ne11             = act->ne[1];
+        const int64_t   nrows            = w0->ne[1];
+        const queue_ptr stream           = ctx.stream();
+        const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+        const int       stride_y         = src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1;
+        ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, q8.get(), (int) ne00,
+                                                              (int) ne11, src1_padded_cols, stream);
+        bool ok;
+        if (last1 > 0) {
+            ok = ggml_sycl_mul_mat_vec_q_reorder_splitk2(w0->type, w0->data, (float *) out0->data, ep0,
+                                                         cg->nodes[i1]->src[0]->data, (float *) out1->data, ep1,
+                                                         q8.get(), (int) ne00, (int) nrows, (int) ne11, stride_y,
+                                                         (int) nrows, stream);
+        } else {
+            ok = ggml_sycl_mul_mat_vec_q_reorder_splitk(w0->type, w0->data, q8.get(), (float *) out0->data,
+                                                        (int) ne00, (int) nrows, (int) ne11, stride_y, (int) nrows,
+                                                        ep0, stream);
+        }
+        if (!ok) {
+            GGML_ABORT("split-K epilogue launch declined after the shape check");
+        }
+        ggml_sycl_gdn_fuse_note(ep0.op == 1 ? 2 : 3);
+        if (last1 > 0) {
+            ggml_sycl_gdn_fuse_note(ep1.op == 1 ? 2 : 3);
+            ggml_sycl_gdn_fuse_note(4);
+            return last1;
+        }
+        return last0;
+    }
+    return -1;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_op_prof_graph_begin(cgraph);
@@ -6270,6 +6582,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        // LOCAL: qwen35 gated-delta layer small-op fusions (GGML_SYCL_GDN_FUSE=1)
+        if (g_ggml_sycl_enable_fusion && ggml_sycl_gdn_fuse_enabled() &&
+            (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD || node->op == GGML_OP_MUL_MAT)) {
+            const int last = ggml_sycl_gdn_try_fuse(*sycl_ctx, cgraph, i);
+            if (last > i) {
+                i = last;
+                continue;
+            }
+        }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
@@ -6565,6 +6886,9 @@ static void ggml_sycl_graph_signature(const ggml_cgraph * cgraph, uint64_t & h1,
 static uint64_t g_gstat_replay = 0, g_gstat_record = 0, g_gstat_eager = 0, g_gstat_fail = 0, g_gstat_flush = 0,
                 g_gstat_evict = 0, g_gstat_selftest_skip = 0;
 static double   g_gstat_sig_us = 0;
+// LOCAL: host time per path (stats on only): eager submit, record (queue capture), finalize, replay submit
+static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
+static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
 
 static void ggml_sycl_graph_stats_print() {
     const uint64_t n = g_gstat_replay + g_gstat_record + g_gstat_eager;
@@ -6573,7 +6897,27 @@ static void ggml_sycl_graph_stats_print() {
                   (unsigned long long) g_gstat_eager, (unsigned long long) g_gstat_fail,
                   (unsigned long long) g_gstat_flush, (unsigned long long) g_gstat_evict,
                   (unsigned long long) g_gstat_selftest_skip, n ? g_gstat_sig_us / n : 0.0);
+    fprintf(stderr, "[SYCL-GRAPH] host ms/call: eager=%.3f record=%.3f finalize=%.3f replay=%.3f\n",
+                  g_gstat_n_eager_timed ? g_gstat_t_eager_us / g_gstat_n_eager_timed / 1e3 : 0.0,
+                  g_gstat_record ? g_gstat_t_record_us / g_gstat_record / 1e3 : 0.0,
+                  g_gstat_n_finalize ? g_gstat_t_finalize_us / g_gstat_n_finalize / 1e3 : 0.0,
+                  g_gstat_replay ? g_gstat_t_replay_us / g_gstat_replay / 1e3 : 0.0);
 }
+
+struct ggml_sycl_gstat_timer {
+    double * acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit ggml_sycl_gstat_timer(double * acc_) : acc(acc_) {
+        if (acc) {
+            t0 = std::chrono::steady_clock::now();
+        }
+    }
+    ~ggml_sycl_gstat_timer() {
+        if (acc) {
+            *acc += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
+    }
+};
 
 // drop every executable graph (waits for the queue first if any of them may still be in flight)
 static void ggml_sycl_graph_cache_flush(ggml_backend_sycl_context * ctx) {
@@ -6656,7 +7000,9 @@ static std::unique_ptr<ggml_sycl_exec_graph_t> ggml_sycl_graph_record(ggml_backe
     sycl::queue & q = *(ctx->stream());
     sycl_ex::command_graph<sycl_ex::graph_state::modifiable> g(q, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
     bool recording = false;
+    const bool timed = ggml_sycl_graph_config().stats > 0;
     try {
+        ggml_sycl_gstat_timer tr(timed ? &g_gstat_t_record_us : nullptr);
         g.begin_recording(q);
         recording = true;
         g_ggml_sycl_graph_recording = true;
@@ -6677,6 +7023,10 @@ static std::unique_ptr<ggml_sycl_exec_graph_t> ggml_sycl_graph_record(ggml_backe
         return nullptr;
     }
     try {
+        ggml_sycl_gstat_timer tf(timed ? &g_gstat_t_finalize_us : nullptr);
+        if (timed) {
+            g_gstat_n_finalize++;
+        }
         return std::make_unique<ggml_sycl_exec_graph_t>(g.finalize());
     } catch (std::exception const & e) {
         GGML_LOG_WARN("[SYCL-GRAPH] finalize failed (%s), graph with %d nodes runs eagerly\n", e.what(), cgraph->n_nodes);
@@ -6746,6 +7096,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
 
     if (e.exec) {
         g_gstat_replay++;
+        ggml_sycl_gstat_timer tp(cfg.stats > 0 ? &g_gstat_t_replay_us : nullptr);
         ctx->stream()->ext_oneapi_graph(*e.exec);
         return;
     }
@@ -6753,7 +7104,11 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
     if (e.no_graph || e.seen < cfg.warmup) {
         e.seen++;
         g_gstat_eager++;
-        ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        {
+            ggml_sycl_gstat_timer te(cfg.stats > 0 ? &g_gstat_t_eager_us : nullptr);
+            g_gstat_n_eager_timed += cfg.stats > 0 ? 1 : 0;
+            ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+        }
         if (cfg.selftest && !e.no_graph) {
             if (!ggml_sycl_graph_poison_outputs(ctx, cgraph)) {
                 g_gstat_selftest_skip++;

@@ -1057,6 +1057,46 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
 }
 
+// LOCAL (GGML_SYCL_GDN_FUSE): qwen35's alpha chain ADD(x, b) -> SOFTPLUS -> MUL(., a) in one launch, with b and a
+// one row each (broadcast over the rest). The caller (ggml-sycl.cpp) checked the pattern: x and mul contiguous, same
+// shape; b and a contiguous with ne[0] elements.
+void ggml_sycl_op_add_softplus_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add, ggml_tensor * softplus,
+                                         ggml_tensor * mul) {
+    scope_op_debug_print scope_dbg_print(__func__, mul, /*num_src=*/2);
+
+    const bool          x_first = add->src[0]->ne[0] == add->ne[0] && ggml_nelements(add->src[0]) == ggml_nelements(add);
+    const ggml_tensor * x       = x_first ? add->src[0] : add->src[1];
+    const ggml_tensor * b       = x_first ? add->src[1] : add->src[0];
+    const ggml_tensor * a       = mul->src[0] == softplus ? mul->src[1] : mul->src[0];
+    const bool          sp_first = mul->src[0] == softplus;
+
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(b) && ggml_is_contiguous(a) && ggml_is_contiguous(mul));
+    GGML_ASSERT(ggml_nelements(b) == x->ne[0] && ggml_nelements(a) == x->ne[0]);
+
+    const float * x_d = (const float *) x->data;
+    const float * b_d = (const float *) b->data;
+    const float * a_d = (const float *) a->data;
+    float *       d_d = (float *) mul->data;
+    const int     n0  = (int) x->ne[0];
+    const int     k   = (int) ggml_nelements(mul);
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const int block = 256;
+    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(ceil_div(k, block) * block), sycl::range<1>(block)),
+                         [=](sycl::nd_item<1> it) {
+                             const int i = it.get_global_id(0);
+                             if (i >= k) {
+                                 return;
+                             }
+                             const int   c  = i % n0;
+                             // binbcast add / mul keep src0 op src1; both are commutative in IEEE float anyway
+                             const float s  = x_first ? x_d[i] + b_d[c] : b_d[c] + x_d[i];
+                             const float sp = op_softplus(s);
+                             d_d[i]         = sp_first ? sp * a_d[c] : a_d[c] * sp;
+                         });
+}
+
 __dpct_inline__ float ggml_sycl_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {
     x = sycl::fmin(x, limit);
     g = sycl::fmax(sycl::fmin(g, limit), -limit);

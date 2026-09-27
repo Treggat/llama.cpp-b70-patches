@@ -1567,7 +1567,8 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            // LOCAL: 2048 tensors (was 128) so the multi-layer chain cases (GDN_CHAIN nl=48) fit
+            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1717,7 +1718,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -4956,6 +4957,97 @@ struct test_ffn_chain : public test_case {
         }
         ggml_set_name(x, "out");
         return x;
+    }
+};
+
+// LOCAL (not for upstream): `nl` chained qwen35 gated-delta layers at a verify token count n, the op sequence
+// llama_model_qwen35::graph::build_layer_attn_linear emits around GATED_DELTA_NET (q/k/v/z are inputs here):
+//   alpha = mul_mat(ssm_alpha, x) -> reshape -> add(ssm_dt) -> softplus -> mul(ssm_a) -> reshape   (gate)
+//   beta  = mul_mat(ssm_beta,  x) -> reshape -> sigmoid
+//   o     = gated_delta_net(l2(q), l2(k), v, gate, beta, state)
+//   y     = rms_norm(o) * ssm_norm * silu(z);  x = x + mul_mat(ssm_out, y)
+// For the SYCL GDN fusions (GGML_SYCL_GDN_FUSE / GGML_SYCL_SMALLROW). perf reports the whole chain per run.
+struct test_gdn_chain : public test_case {
+    const ggml_type type_w;
+    const int64_t   n_embd, n, nl;
+
+    static constexpr int64_t H_K = 16, H_V = 48, D = 128;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GDN_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR4(type_w, n_embd, n, nl); }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 1ULL << 50; }
+
+    test_gdn_chain(ggml_type type_w = GGML_TYPE_Q4_K, int64_t n_embd = 5120, int64_t n = 6, int64_t nl = 1)
+        : type_w(type_w), n_embd(n_embd), n(n), nl(nl) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type_w, n_embd, H_V);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type_w, n_embd, H_V);
+        ggml_tensor * w_out   = ggml_new_tensor_2d(ctx, type_w, D * H_V, n_embd);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_V);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_V);
+        ggml_tensor * w_norm  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(w_alpha, "ssm_alpha");
+        ggml_set_name(w_beta, "ssm_beta");
+        ggml_set_name(w_out, "ssm_out");
+        ggml_set_name(dt, "ssm_dt");
+        ggml_set_name(a, "ssm_a");
+        ggml_set_name(w_norm, "ssm_norm");
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H_V, n, 1);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H_V, n, 1);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H_V, n, 1);
+        ggml_tensor * z     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D * H_V, n);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, H_V, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(z, "z");
+        ggml_set_name(state, "state");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+        ggml_set_name(x, "x");
+
+        for (int64_t l = 0; l < nl; ++l) {
+            ggml_tensor * beta = ggml_mul_mat(ctx, w_beta, x);
+            beta = ggml_reshape_4d(ctx, beta, 1, H_V, n, 1);
+            beta = ggml_sigmoid(ctx, beta);
+
+            ggml_tensor * alpha = ggml_mul_mat(ctx, w_alpha, x);
+            alpha = ggml_reshape_3d(ctx, alpha, H_V, n, 1);
+            ggml_tensor * gate = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+            gate = ggml_reshape_4d(ctx, gate, 1, H_V, n, 1);
+
+            ggml_tensor * gdn = ggml_gated_delta_net(ctx, ggml_l2_norm(ctx, q, 1e-6f), ggml_l2_norm(ctx, k, 1e-6f), v,
+                                                     gate, beta, state, 1);
+            ggml_tensor * o = ggml_view_4d(ctx, gdn, D, H_V, n, 1, ggml_row_size(gdn->type, D),
+                                           ggml_row_size(gdn->type, D * H_V), ggml_row_size(gdn->type, D * H_V * n), 0);
+
+            ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w_norm);
+            y = ggml_mul(ctx, y, ggml_silu(ctx, ggml_reshape_4d(ctx, z, D, H_V, n, 1)));
+            y = ggml_reshape_2d(ctx, y, D * H_V, n);
+
+            x = ggml_add(ctx, x, ggml_mul_mat(ctx, w_out, y));
+        }
+        ggml_set_name(x, "out");
+        return x;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "x") == 0) {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (strcmp(t->name, "ssm_a") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.05f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -10003,6 +10095,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, nc, 1024, { 1, 1 }, { 1, 1 }));
         }
     }
+    // LOCAL (not for upstream): small-row q4_K / q6_K weights (SYCL split-K MMVQ, GGML_SYCL_SMALLROW): the house model's
+    // ssm_alpha / ssm_beta (48 x 5120) and attn_k / attn_v (1024 x 5120), a row count that is no multiple of 16, a short
+    // K (fewer q-blocks than K-splits) and the 2048-row default limit
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (auto [m, k] : std::vector<std::pair<int,int>>{ {48, 5120}, {40, 5120}, {1024, 5120}, {48, 512}, {2048, 1024}, {7, 2816} }) {
+            for (int nc : { 1, 2, 3, 5, 8 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, nc, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    // LOCAL (not for upstream): qwen35 gated-delta layer chains (SYCL GDN fusions)
+    for (ggml_type type_w : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int nc : { 1, 2, 3, 6, 8 }) {
+            test_cases.emplace_back(new test_gdn_chain(type_w, 5120, nc, 1));
+        }
+        // (no multi-layer eval case: the residual chain amplifies the q8_1-vs-CPU activation quantization gap past
+        // the 5e-4 NMSE bound even with every fusion off - nl=3 measured 3.7e-3 / 7.9e-3 unfused)
+    }
     // LOCAL (not for upstream): q4_K / q6_K gate/up + GLU at model-like rows. Inside the XMX column window (default
     // 3..8) the SYCL fusion declines and the pair runs as two XMX mul_mats + GLU; at 2 columns it stays fused MMVQ.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
@@ -11219,6 +11329,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int nc : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
         }
+    }
+    // LOCAL: small-row weights at 1..8 columns (SYCL split-K MMVQ, GGML_SYCL_SMALLROW): ssm_alpha/beta, attn_k/v
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int m : { 48, 1024, 2048 }) {
+            for (int nc = 1; nc <= 8; ++nc) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, nc, 5120, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    // LOCAL: 8 chained qwen35 gated-delta layers (SYCL GDN fusions) at verify token counts
+    for (int nc : { 1, 4, 6, 8 }) {
+        test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 8));
+    }
+    // model-sized graphs (48 layers, ~1000 kernels) for the SYCL graph-cache host costs (GGML_SYCL_GRAPH_STATS):
+    // each token count is a new cache key (eager, record + finalize, then replays)
+    for (int nc : { 6, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 48));
     }
     // LOCAL: 8 chained 27B-class FFN blocks (q4_K) at verify column counts
     // (nw 1: rms_norm x weight, the model's fused norm kernel)

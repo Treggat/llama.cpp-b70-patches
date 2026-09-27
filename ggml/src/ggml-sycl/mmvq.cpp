@@ -2358,6 +2358,20 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
 
+    // LOCAL: small-row q4_K / q6_K weights on the split-K kernel (GGML_SYCL_SMALLROW=1)
+    {
+        const auto * extra0 = (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+        if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_smallrow_can_use(src0->type, row_diff, src1_ncols) &&
+            ne00 % QK_K == 0) {
+            const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+            if (ggml_sycl_mul_mat_vec_q_reorder_splitk(src0->type, src0_dd_i, src1_ddq_i, dst_dd_i, (int) ne00,
+                                                       (int) row_diff, (int) src1_ncols, stride_col_y_bytes,
+                                                       (int) dst->ne[0], ggml_sycl_mmvq_epilogue{}, stream)) {
+                return;
+            }
+        }
+    }
+
     for (int i = 0; i < src1_ncols; i++) {
         const size_t src1_ddq_i_offset = i * src1_padded_col_size * q8_1_ts / q8_1_bs;
         const char * src1_ddq_i_bs     = src1_ddq_i + src1_ddq_i_offset;
@@ -3316,4 +3330,264 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
         default:
             return false;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// LOCAL: split-K reorder MMVQ for small row counts (GGML_SYCL_SMALLROW=1). See mmvq.hpp.
+// ---------------------------------------------------------------------------------------------------------------
+
+static int ggml_sycl_smallrow_env(const char * name, int def) {
+    const char * e = getenv(name);
+    return e && *e ? atoi(e) : def;
+}
+
+bool ggml_sycl_smallrow_enabled() {
+    static const bool v = ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW", 0) != 0;
+    return v;
+}
+
+// Row limits, measured on B70 with graph replay (test-backend-ops perf, k=5120, 2..8 columns):
+//   q4_K   48 rows: 10.5-12.0 us (XMX / MMVQ) -> 4.8-6.1 us split-K
+//   q4_K 1024 rows: 11.4 us flat on XMX       -> 10-22 us split-K (grows ~2 us per column): XMX keeps it
+//   q6_K   48 rows: 9.6-27.3 us (MMVQ)        -> 4.5-5.9 us
+//   q6_K 1024 rows: 10.5-27.0 us (MMVQ)       -> 10.3-21.1 us
+//   q6_K 2048 rows: 14.9-19.8 us (XMX)        -> 16-37 us: XMX keeps it
+static int ggml_sycl_smallrow_max_rows(ggml_type type) {
+    static const int v4 = ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_MAX_ROWS_Q4K", 256);
+    static const int v6 = ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_MAX_ROWS_Q6K", 1024);
+    return type == GGML_TYPE_Q4_K ? v4 : v6;
+}
+
+static int ggml_sycl_smallrow_min_cols() {
+    static const int v = std::max(1, ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_MIN_COLS", 2));
+    return v;
+}
+
+// sub-groups the launch aims for (B70: 32 Xe2 cores x 8 vector engines x 8 threads = 2048 hardware threads)
+static int ggml_sycl_smallrow_target_sg() {
+    static const int v = std::max(1, ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_SG", 4096));
+    return v;
+}
+
+// forced K-split (0 = derived from the target above)
+static int ggml_sycl_smallrow_forced_ks() {
+    static const int v = std::max(0, ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_KS", 0));
+    return v;
+}
+
+bool ggml_sycl_smallrow_shape_ok(ggml_type type, int64_t nrows, int64_t ncols, int64_t ncols_dst) {
+    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    return nrows >= 1 && nrows <= ggml_sycl_smallrow_max_rows(type) && ncols % QK_K == 0 && ncols_dst >= 1 &&
+           ncols_dst <= 8;
+}
+
+bool ggml_sycl_smallrow_can_use(ggml_type type, int64_t nrows, int64_t ncols_dst) {
+    if (!ggml_sycl_smallrow_enabled()) {
+        return false;
+    }
+    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    return nrows >= 1 && nrows <= ggml_sycl_smallrow_max_rows(type) && ncols_dst >= ggml_sycl_smallrow_min_cols() &&
+           ncols_dst <= 8;
+}
+
+// the float ops of element_wise.cpp's op_sigmoid / op_softplus and binbcast's add / mul, in the same order
+static __dpct_inline__ float smallrow_sigmoid(float x) {
+    return 1.0f / (1.0f + sycl::exp(-x));
+}
+
+static __dpct_inline__ float smallrow_softplus(float x) {
+    const float ax = sycl::fabs(x);
+    const float m  = sycl::fmax(x, 0.0f);
+    return m + sycl::log1p(sycl::exp(-ax));
+}
+
+// one weight matrix of a (possibly dual) split-K launch: two same-shape weights that share the activations (qwen35
+// ssm_alpha and ssm_beta) run as one launch over 2 x nrows work-groups
+struct ggml_sycl_splitk_job {
+    const void *            vx  = nullptr;
+    float *                 dst = nullptr;
+    ggml_sycl_mmvq_epilogue ep;
+};
+
+template <typename reorder_vec_dot_q_sycl, int ncols_dst>
+static void mul_mat_vec_q_reorder_splitk(const ggml_sycl_splitk_job j0, const ggml_sycl_splitk_job j1,
+                                         const void * __restrict__ vy, const int ncols, const int nrows,
+                                         const int stride_col_y_bytes, const int stride_col_dst, float * slm,
+                                         const sycl::nd_item<1> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg    = nd_item.get_sub_group();
+    const int  ks    = sg.get_group_linear_range();   // sub-groups per work-group = K splits
+    const int  sg_id = sg.get_group_linear_id();
+    const int  lane  = sg.get_local_linear_id();
+    const int  gid   = nd_item.get_group_linear_id();  // one work-group per weight row
+    const bool second = gid >= nrows;                    // work-group uniform
+    const int  row    = second ? gid - nrows : gid;
+    const void * __restrict__    vx  = second ? j1.vx : j0.vx;
+    float * __restrict__         dst = second ? j1.dst : j0.dst;
+    const ggml_sycl_mmvq_epilogue ep = second ? j1.ep : j0.ep;
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * blocks_per_row;
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    float partial[ncols_dst] = {};
+    for (int i = sg_id * blocks_per_subgroup + lane / block_elements_per_subgroup; i < blocks_per_row;
+         i += ks * blocks_per_subgroup) {
+        const int  ibx       = row * blocks_per_row + i;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (lane % block_elements_per_subgroup);
+            if constexpr (reorder_vec_dot_shared_weights<reorder_vec_dot_q_sycl::gtype>::value) {
+                const auto wx = reorder_vec_dot_q_sycl::load(vx, bx_offset, d_offset, iqs);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const char *        vy_j           = (const char *) vy + j * stride_col_y_bytes;
+                    const int8_t *      q8_1_quant_ptr = (const int8_t *) vy_j + iby * QK8_1;
+                    const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) (vy_j + ncols + iby * sizeof(sycl::half2));
+                    partial[j] += reorder_vec_dot_q_sycl::dot(wx, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const char *        vy_j           = (const char *) vy + j * stride_col_y_bytes;
+                    const int8_t *      q8_1_quant_ptr = (const int8_t *) vy_j + iby * QK8_1;
+                    const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) (vy_j + ncols + iby * sizeof(sycl::half2));
+                    partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const float s = sycl::reduce_over_group(sg, partial[j], std::plus<>());
+        if (lane == 0) {
+            slm[sg_id * ncols_dst + j] = s;
+        }
+    }
+    sycl::group_barrier(nd_item.get_group());
+
+    if (sg_id == 0 && lane < ncols_dst) {
+        const int j   = lane;
+        float     sum = 0.0f;
+        for (int k = 0; k < ks; ++k) {   // fixed order: the result does not depend on scheduling
+            sum += slm[k * ncols_dst + j];
+        }
+        if (ep.op == 1) {
+            sum = smallrow_sigmoid(sum);
+        } else if (ep.op == 2) {
+            const float biased = sum + ep.b[row];
+            sum                = smallrow_softplus(biased) * ep.a[row];
+        }
+        dst[j * stride_col_dst + row] = sum;
+    }
+}
+
+template <typename vec_dot, int ncols_dst>
+static void launch_mul_mat_vec_q_reorder_splitk(const ggml_sycl_splitk_job & j0, const ggml_sycl_splitk_job & j1,
+                                                const int nmat, const void * vy, const int ncols, const int nrows,
+                                                const int stride_col_y_bytes, const int stride_col_dst,
+                                                dpct::queue_ptr stream) {
+    using block_type   = ggml_sycl_reordered::block_q_t<vec_dot::gtype>;
+    using block_traits = typename block_type::traits;
+    constexpr int blocks_per_subgroup = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+
+    const int blocks_per_row = ncols / block_traits::qk;
+    const int max_ks         = std::max(1, std::min(64, (int) ceil_div(blocks_per_row, blocks_per_subgroup)));
+    int       ks             = ggml_sycl_smallrow_forced_ks();
+    if (ks == 0) {
+        ks = (int) ceil_div(ggml_sycl_smallrow_target_sg(), nmat * nrows);
+    }
+    ks = std::max(1, std::min(ks, max_ks));
+
+    const sycl::range<1>       local(ks * WARP_SIZE);
+    const sycl::range<1>       global((size_t) nmat * nrows * ks * WARP_SIZE);
+    const ggml_sycl_splitk_job a = j0;
+    const ggml_sycl_splitk_job b = j1;
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(ks * ncols_dst), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(global, local),
+                         [=](sycl::nd_item<1> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder_splitk<vec_dot, ncols_dst>(
+                                 a, b, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                 slm.get_multi_ptr<sycl::access::decorated::no>().get(), nd_item);
+                         });
+    });
+}
+
+template <typename vec_dot>
+static bool mul_mat_vec_q_reorder_splitk_switch(const ggml_sycl_splitk_job & j0, const ggml_sycl_splitk_job & j1,
+                                                int nmat, const void * vy, int ncols, int nrows, int ncols_dst,
+                                                int stride_col_y_bytes, int stride_col_dst, dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 1>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 2: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 2>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 3: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 3>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 4: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 4>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 5: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 5>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 6: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 6>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 7: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 7>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 8: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 8>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        default: return false;
+    }
+}
+
+static bool ggml_sycl_splitk_dispatch(ggml_type src0_type, const ggml_sycl_splitk_job & j0,
+                                      const ggml_sycl_splitk_job & j1, int nmat, const void * vy, int ncols,
+                                      int nrows, int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+                                      dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+            return mul_mat_vec_q_reorder_splitk_switch<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                j0, j1, nmat, vy, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_Q6_K:
+            return mul_mat_vec_q_reorder_splitk_switch<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                j0, j1, nmat, vy, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        default:
+            return false;
+    }
+}
+
+bool ggml_sycl_mul_mat_vec_q_reorder_splitk(ggml_type src0_type, const void * vx, const void * vy, float * dst,
+                                            int ncols, int nrows, int ncols_dst, int stride_col_y_bytes,
+                                            int stride_col_dst, const ggml_sycl_mmvq_epilogue & ep,
+                                            dpct::queue_ptr stream) {
+    ggml_sycl_splitk_job j0;
+    j0.vx  = vx;
+    j0.dst = dst;
+    j0.ep  = ep;
+    return ggml_sycl_splitk_dispatch(src0_type, j0, j0, 1, vy, ncols, nrows, ncols_dst, stride_col_y_bytes,
+                                     stride_col_dst, stream);
+}
+
+bool ggml_sycl_mul_mat_vec_q_reorder_splitk2(ggml_type src0_type, const void * vx0, float * dst0,
+                                             const ggml_sycl_mmvq_epilogue & ep0, const void * vx1, float * dst1,
+                                             const ggml_sycl_mmvq_epilogue & ep1, const void * vy, int ncols,
+                                             int nrows, int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+                                             dpct::queue_ptr stream) {
+    ggml_sycl_splitk_job j0, j1;
+    j0.vx  = vx0;
+    j0.dst = dst0;
+    j0.ep  = ep0;
+    j1.vx  = vx1;
+    j1.dst = dst1;
+    j1.ep  = ep1;
+    return ggml_sycl_splitk_dispatch(src0_type, j0, j1, 2, vy, ncols, nrows, ncols_dst, stride_col_y_bytes,
+                                     stride_col_dst, stream);
 }

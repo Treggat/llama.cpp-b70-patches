@@ -148,7 +148,9 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
     }
 }
 
-template <bool do_multiply = false, bool do_add = false>
+// do_gate (LOCAL, GGML_SYCL_GDN_FUSE): the `add` operand is instead a gate z, and the epilogue is
+// (scale * x * mul) * silu(z) - qwen35's build_norm_gated (rms_norm, mul, silu, mul) in one launch
+template <bool do_multiply = false, bool do_add = false, bool do_gate = false>
 static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
@@ -160,6 +162,7 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const float scale_mul = 1.0f) {
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+    static_assert(!do_gate || (do_multiply && !do_add), "the gate epilogue needs mul and replaces add");
 
     const int sample  = item_ct1.get_group(0);
     const int channel = item_ct1.get_group(1);
@@ -183,7 +186,7 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
         mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
     }
 
-    if constexpr (do_add) {
+    if constexpr (do_add || do_gate) {
         const int add_row     = row     % add_nrows;
         const int add_channel = channel % add_nchannels;
         const int add_sample  = sample  % add_nsamples;
@@ -221,7 +224,13 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const float scale = sycl::rsqrt(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        if constexpr (do_multiply && do_add) {
+        if constexpr (do_gate) {
+            // the three unfused kernels' float ops, in order: rms_norm x mul (one kernel), silu (op_silu), mul
+            const float t = scale * x[col * src_stride_col] * mul[col];
+            const float z = add[col];
+            const float g = z / (1.0f + sycl::exp(-z));
+            dst[col * dst_stride_col] = t * g;
+        } else if constexpr (do_multiply && do_add) {
             dst[col * dst_stride_col] = scale * x[col * src_stride_col] * mul[col] + add[col];
         } else if constexpr (do_multiply) {
             dst[col * dst_stride_col] = scale * x[col * src_stride_col] * mul[col];
@@ -918,6 +927,66 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples,
         add_s01, add_s02, add_s03, add_nrows, add_nchannels, add_nsamples, eps, main_stream, ctx.device);
+}
+
+// LOCAL (GGML_SYCL_GDN_FUSE): mul2 = (rms_norm(x) * w) * silu(z), qwen35 build_norm_gated. The caller checked the
+// pattern (ggml-sycl.cpp): z has x's shape with contiguous rows, w spans one row, mul2 has contiguous rows.
+void ggml_sycl_op_rms_norm_mul_silu_gate(ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul1,
+                                         ggml_tensor * silu, ggml_tensor * mul2) {
+    scope_op_debug_print scope_dbg_print(__func__, mul2, /*num_src=*/2);
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul1->src[0] == rms_norm ? mul1->src[1] : mul1->src[0];
+    const ggml_tensor * z = silu->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 &&
+                mul2->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && z->nb[0] == sizeof(float) &&
+                mul2->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(x, z) && ggml_are_same_shape(x, mul2));
+
+    const int64_t ne00 = x->ne[0], ne01 = x->ne[1], ne02 = x->ne[2], ne03 = x->ne[3];
+    const int64_t ts   = sizeof(float);
+
+    const int ncols = (int) ne00;
+    const sycl::range<3> global_dims(ne03, ne02, ne01);
+
+    const float * x_dd = (const float *) x->data;
+    const float * w_dd = (const float *) w->data;
+    const float * z_dd = (const float *) z->data;
+    float *       d_dd = (float *) mul2->data;
+
+    const int64_t s01 = x->nb[1] / ts, s02 = x->nb[2] / ts, s03 = x->nb[3] / ts;
+    const int64_t d01 = mul2->nb[1] / ts, d02 = mul2->nb[2] / ts, d03 = mul2->nb[3] / ts;
+    const int64_t w01 = w->nb[1] / ts, w02 = w->nb[2] / ts, w03 = w->nb[3] / ts;
+    const int     wn1 = (int) w->ne[1], wn2 = (int) w->ne[2], wn3 = (int) w->ne[3];
+    const int64_t z01 = z->nb[1] / ts, z02 = z->nb[2] / ts, z03 = z->nb[3] / ts;
+    const int     zn1 = (int) z->ne[1], zn2 = (int) z->ne[2], zn3 = (int) z->ne[3];
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    auto kern = [=](const sycl::nd_item<3> & item_ct1, float * s_sum, int wg) {
+        rms_norm_f32<true, false, true>(x_dd, d_dd, ncols,
+            1, s01, s02, s03, 1, d01, d02, d03,
+            eps, item_ct1, s_sum, wg,
+            w_dd, w01, w02, w03, wn1, wn2, wn3,
+            z_dd, z01, z02, z03, zn1, zn2, zn3);
+    };
+    if (ncols < 1024) {
+        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 kern(item_ct1, nullptr, WARP_SIZE);
+                             });
+        });
+    } else {
+        rms_norm_submit_wide(stream, global_dims, ctx.device, kern);
+    }
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

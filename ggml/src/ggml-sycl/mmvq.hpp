@@ -93,4 +93,54 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
     int                stride_col_dst,       // floats between output columns in dst
     dpct::queue_ptr    stream);
 
+// LOCAL: split-K reorder MMVQ for weights with few rows (GGML_SYCL_SMALLROW=1, default off). The row-per-sub-group
+// MMVQ kernels leave the device mostly idle on e.g. 48 x 5120 (ssm_alpha / ssm_beta) or 1024 x 5120 (attn_k / attn_v):
+// each row is one serial chain over K. Here a work-group of `ks` sub-groups shares one row, each sub-group takes every
+// ks-th q-block, and the partial sums are added in a fixed order through local memory (deterministic).
+// Optional epilogue, applied to the finished dot product (the float ops the unfused graph nodes perform):
+//   op 1: sigmoid(v)                          (qwen35 beta)
+//   op 2: softplus(v + b[row]) * a[row]       (qwen35 alpha -> ADD ssm_dt -> SOFTPLUS -> MUL ssm_a)
+struct ggml_sycl_mmvq_epilogue {
+    int           op = 0;
+    const float * b  = nullptr;
+    const float * a  = nullptr;
+};
+
+bool ggml_sycl_smallrow_enabled();
+// q4_K / q6_K in the reorder layout, nrows <= GGML_SYCL_SMALLROW_MAX_ROWS_Q4K (256) / _Q6K (1024), columns in
+// [GGML_SYCL_SMALLROW_MIN_COLS (2), 8]
+bool ggml_sycl_smallrow_can_use(enum ggml_type type, int64_t nrows, int64_t ncols_dst);
+// same without the column window (fused epilogues also serve 1 column)
+bool ggml_sycl_smallrow_shape_ok(enum ggml_type type, int64_t nrows, int64_t ncols, int64_t ncols_dst);
+
+bool ggml_sycl_mul_mat_vec_q_reorder_splitk(
+    enum ggml_type                  src0_type,
+    const void *                    vx,
+    const void *                    vy,                  // quantize_and_reorder_q8_1_soa activations
+    float *                         dst,
+    int                             ncols,               // K
+    int                             nrows,
+    int                             ncols_dst,           // 1..8
+    int                             stride_col_y_bytes,
+    int                             stride_col_dst,
+    const ggml_sycl_mmvq_epilogue & ep,
+    dpct::queue_ptr                 stream);
+
+// two same-type, same-shape weights over the same activations in one launch (qwen35 ssm_alpha + ssm_beta)
+bool ggml_sycl_mul_mat_vec_q_reorder_splitk2(
+    enum ggml_type                  src0_type,
+    const void *                    vx0,
+    float *                         dst0,
+    const ggml_sycl_mmvq_epilogue & ep0,
+    const void *                    vx1,
+    float *                         dst1,
+    const ggml_sycl_mmvq_epilogue & ep1,
+    const void *                    vy,
+    int                             ncols,
+    int                             nrows,
+    int                             ncols_dst,
+    int                             stride_col_y_bytes,
+    int                             stride_col_dst,
+    dpct::queue_ptr                 stream);
+
 #endif // GGML_SYCL_MMVQ_HPP
