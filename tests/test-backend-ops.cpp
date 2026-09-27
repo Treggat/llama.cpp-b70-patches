@@ -1189,6 +1189,11 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
 struct test_case {
     virtual ~test_case() {}
 
+    // LOCAL (not for upstream): perf mode computes this tensor once, in a graph of its own, before the warmup run
+    // and outside the timed region (build_graph may set it; e.g. a decode-size op that installs a backend's
+    // weight layout the way a model's decode steps would before a prefill)
+    ggml_tensor * perf_pre = nullptr;
+
     virtual std::string op_desc(ggml_tensor * t) {
         return ggml_op_desc(t);
     }
@@ -1568,11 +1573,13 @@ struct test_case {
 
         ggml_init_params params = {
             // LOCAL: 2048 tensors (was 128) so the multi-layer chain cases (GDN_CHAIN nl=48) fit
-            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false) +
+                              ggml_graph_overhead_custom(64, false),   // LOCAL: + the perf_pre graph
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
         const bool use_weights = use_weight_context();
+        perf_pre = nullptr;
 
         ggml_context_ptr ctx(ggml_init(params)); // smart ptr
         GGML_ASSERT(ctx);
@@ -1618,6 +1625,17 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+
+        // LOCAL: the perf_pre tensor, once, untimed
+        if (perf_pre != nullptr) {
+            ggml_cgraph * gp = ggml_new_graph_custom(ctx.get(), 64, false);
+            ggml_build_forward_expand(gp, perf_pre);
+            if (ggml_backend_graph_compute(backend, gp) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "%s: perf_pre graph failed\n", __func__);
+                return false;
+            }
+            ggml_backend_synchronize(backend);
         }
 
         // build graph
@@ -5177,6 +5195,31 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// LOCAL (not for upstream): a prefill-size mul_mat whose weight has first been through one decode-size (1 column)
+// mul_mat, untimed (perf_pre), as in a server that has decoded before it prefills. On SYCL that decode step installs
+// the MMVQ reorder layout, so the prefill op measures the reorder variant of the dequantize the seat actually runs.
+// The graph itself is the plain mul_mat (eval mode is identical to MUL_MAT).
+struct test_mul_mat_prefill : public test_mul_mat {
+    test_mul_mat_prefill(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PREFILL";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        ggml_tensor * a = ggml_get_tensor(ctx, "a");
+        GGML_ASSERT(a != nullptr);
+        ggml_tensor * b1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b1, "b_decode");
+        perf_pre = ggml_mul_mat(ctx, a, b1);
+        ggml_set_name(perf_pre, "out_decode");
+        return out;
     }
 };
 
@@ -10124,6 +10167,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // LOCAL (not for upstream): prefill-size q4_K / q6_K at the house model's shapes (SYCL dq-gemm path,
+    // GGML_SYCL_DQ_GEMM=1: full 2048-token ubatches, a ragged tail and a 512 ubatch)
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120} }) {
+        for (int nc : { 512, 700, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            if ((nw == 5120 && kw == 17408) || (nw == 10240 && kw == 5120)) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    // LOCAL: dq-gemm edges: around the default 64-column threshold, a token count off every tile, rows off the fused
+    // kernel's 128-row tile (4100) and a tiny weight (48 rows, ssm_alpha) that the reference entry serves
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int nc : { 17, 32, 33, 63, 64, 65, 257, 300 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, nc, 1024, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, 128, 1024, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 512, 5120, { 1, 1 }, { 1, 1 }));
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -11359,6 +11422,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {5120, 17408}, {10240, 5120}, {1024, 5120} }) {
         for (int nc = 1; nc <= 8; ++nc) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    // LOCAL (not for upstream): prefill-size matmuls at the house model's shapes for the SYCL dq-gemm path: full
+    // 2048-token ubatches, a ragged tail (700) and 512. MUL_MAT = a fresh weight (SYCL: the plain-layout dequantize
+    // unless dq-gemm installs the reorder); MUL_MAT_PREFILL = the same op after one untimed decode step on the weight
+    // (reorder layout, as the seat runs it). f16 weights for the GEMM-only reference.
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
+                                                         {12288, 5120}, {5120, 6144} }) {
+        for (int nc : { 512, 700, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q4_K, nw, nc, kw));
+            if ((nw == 5120 && kw == 17408) || (nw == 10240 && kw == 5120)) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q6_K, nw, nc, kw));
+            }
+            if (nw == 17408 || (nw == 5120 && kw == 17408)) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+    // LOCAL: short prefill ubatches / prompt tails, for tuning GGML_SYCL_DQ_GEMM_MIN_COLS
+    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408} }) {
+        for (int nc : { 17, 32, 48, 64, 128, 256, 300, 1024, 1280, 1536, 1792 }) {
+            test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q4_K, nw, nc, kw));
         }
     }
 

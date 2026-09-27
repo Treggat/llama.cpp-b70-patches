@@ -69,6 +69,7 @@
 #include "ggml-sycl/mmq-dnn-u4.hpp"
 #include "ggml-sycl/mmq-xmx-q4k.hpp"
 #include "ggml-sycl/mmq-xmx-q6k.hpp"
+#include "ggml-sycl/dq-gemm.hpp"
 #include "ggml-sycl/fattn-xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
@@ -461,6 +462,8 @@ static void ggml_check_sycl() try {
             }
             GGML_LOG_INFO(")\n");
             GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (built, same matrix check)\n", (int) ggml_sycl_xmx_q6k_env());
+            GGML_LOG_INFO("  GGML_SYCL_DQ_GEMM: %d (cols %d..%d)\n", (int) ggml_sycl_dq_gemm_env(),
+                          ggml_sycl_dq_gemm_min_cols(), ggml_sycl_dq_gemm_max_cols());
         } else {
             GGML_LOG_INFO("  GGML_SYCL_XMX_Q4K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q4k_env());
             GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q6k_env());
@@ -3001,6 +3004,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
 
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+        // LOCAL: sub-phase times under GGML_SYCL_OP_PROFILE (no waits otherwise)
+        ggml_sycl_phase_timer pt(stream);
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
@@ -3010,6 +3015,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
             to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            pt.mark(src0->extra && ((ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder ?
+                        "dequant(reorder)" : "dequant(plain)");
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i
@@ -3024,6 +3031,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
             to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            pt.mark("act_f16");
         }
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1->data + src1_padded_row_size
@@ -3034,6 +3042,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+                pt.mark("gemm", "gemm_host");
         }
         else
 #endif
@@ -4915,6 +4924,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
                    __func__, src0->name, ggml_type_name(src1->type), (long long) src1->ne[0], (long long) src1->ne[1],
                    (long long) src1->ne[2], ggml_type_name(dst->type));
     }
+    // LOCAL: prefill (>= GGML_SYCL_DQ_GEMM_MIN_COLS columns) q4_K / q6_K on the dq-gemm entry (dq-gemm.cpp). It reads
+    // the MMVQ reorder layout, so it installs the same reorder here (a no-op once decode has done it). Default off
+    // (GGML_SYCL_DQ_GEMM=1). Without the reorder (GGML_SYCL_ENABLE_OPT=0, ...) the op stays on the path below.
+    if (!split && ggml_sycl_dq_gemm_can_use(ctx, src0, src1, dst)) {
+        opt_for_reorder_id(&ctx, src0);
+        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (extra && extra->optimized_feature.reorder) {
+            ggml_sycl_mul_mat_dq_gemm(ctx, src0, src1, dst);
+            return;
+        }
+    }
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
@@ -6158,6 +6178,20 @@ struct ggml_sycl_op_prof_bucket { int64_t graphs = 0; int64_t skipped = 0; doubl
 static std::map<std::pair<int, int64_t>, ggml_sycl_op_prof_bucket> g_sycl_op_prof; // (n_nodes, n_tokens)
 static ggml_sycl_op_prof_bucket * g_sycl_op_prof_cur = nullptr;
 static int64_t g_sycl_op_prof_total_graphs = 0;
+static const std::string * g_sycl_op_prof_cur_key = nullptr;   // key of the op being timed (sub-phase rows)
+
+bool ggml_sycl_op_prof_active() {
+    return g_sycl_op_prof_cur != nullptr && g_sycl_op_prof_cur_key != nullptr;
+}
+
+void ggml_sycl_op_prof_sub_add(const char * sub, double ms) {
+    if (!ggml_sycl_op_prof_active()) {
+        return;
+    }
+    auto & acc = g_sycl_op_prof_cur->ops[*g_sycl_op_prof_cur_key + "  /" + sub];
+    acc.ms += ms;
+    acc.n  += 1;
+}
 
 static void ggml_sycl_op_prof_print() {
     for (auto & kv : g_sycl_op_prof) {
@@ -6167,8 +6201,10 @@ static void ggml_sycl_op_prof_print() {
         std::vector<std::pair<std::string, ggml_sycl_op_prof_acc>> rows(b.ops.begin(), b.ops.end());
         std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & c) { return a.second.ms > c.second.ms; });
         for (const auto & r : rows) {
-            fprintf(stderr, "[sycl-prof]   %-40s %9.3f ms/graph %5.1f%%  x%.1f/graph\n", r.first.c_str(),
-                    r.second.ms / b.graphs, 100.0 * r.second.ms / b.ms, (double) r.second.n / b.graphs);
+            fprintf(stderr, "[sycl-prof]   %-40s %9.3f ms/graph %5.1f%%  x%.1f/graph  (%.4f ms/call, %lld calls)\n",
+                    r.first.c_str(), r.second.ms / b.graphs, 100.0 * r.second.ms / b.ms,
+                    (double) r.second.n / b.graphs, r.second.ms / std::max<int64_t>(1, r.second.n),
+                    (long long) r.second.n);
         }
     }
     fflush(stderr);
@@ -6192,6 +6228,9 @@ static std::string ggml_sycl_op_prof_key(const ggml_tensor * node) {
         key += std::string("_") + ggml_unary_op_name(ggml_get_unary_op(node));
     } else if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         key += std::string("_") + ggml_type_name(node->src[0]->type) + "_n" + std::to_string(node->ne[1]);
+        if (node->ne[1] > 16) {   // LOCAL: prefill-size ops also keyed by weight shape (m x k)
+            key += "_" + std::to_string(node->src[0]->ne[1]) + "x" + std::to_string(node->src[0]->ne[0]);
+        }
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         key += "_kv" + std::to_string(node->src[1]->ne[1]) + "_n" + std::to_string(node->src[0]->ne[1]);
     } else if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -6211,10 +6250,12 @@ struct ggml_sycl_op_prof_scope {
         ctx = c;
         key = ggml_sycl_op_prof_key(node);
         ctx->stream()->wait();
+        g_sycl_op_prof_cur_key = &key;
         t0 = std::chrono::steady_clock::now();
     }
     ~ggml_sycl_op_prof_scope() {
         if (ctx == nullptr) return;
+        g_sycl_op_prof_cur_key = nullptr;
         ctx->stream()->wait();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         auto & acc = g_sycl_op_prof_cur->ops[key];
