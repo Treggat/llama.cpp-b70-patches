@@ -464,7 +464,9 @@ static void ggml_check_sycl() try {
                 GGML_LOG_INFO(" dev%u %s", i, ggml_sycl_xmx_q4k_device_ok((int) i) ? "YES" : "NO");
             }
             GGML_LOG_INFO(")\n");
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q4K_DIRECT: %d (register-fed DPAS, 1..8 columns)\n", (int) ggml_sycl_xmx_q4k_direct_env());
             GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (built, same matrix check)\n", (int) ggml_sycl_xmx_q6k_env());
+            GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K_DIRECT: %d (register-fed DPAS)\n", (int) ggml_sycl_xmx_q6k_direct_env());
             GGML_LOG_INFO("  GGML_SYCL_DQ_GEMM: %d (cols %d..%d)\n", (int) ggml_sycl_dq_gemm_env(),
                           ggml_sycl_dq_gemm_min_cols(), ggml_sycl_dq_gemm_max_cols());
         } else {

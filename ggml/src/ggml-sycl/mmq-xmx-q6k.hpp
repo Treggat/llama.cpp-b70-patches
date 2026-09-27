@@ -36,6 +36,12 @@ bool ggml_sycl_xmx_q6k_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
 // with the op below (A/B only)
 int ggml_sycl_xmx_q6k_path();
 
+// GGML_SYCL_XMX_Q6K_DIRECT=1 (default 0): the register-fed DPAS kernel of mmq-xmx-direct.cpp instead of the
+// joint_matrix kernel (bit-identical at the same split-K; GGML_SYCL_XMX_Q6K_DIRECT_KS: 0 = the joint_matrix kernel's
+// split-K, n > 0 = n, default: its own table)
+bool ggml_sycl_xmx_q6k_direct_env();
+
+
 // the whole mul_mat for a src0 already in the reorder layout: quantizes src1 straight into the kernel's operands with
 // MMVQ's own q8_1 routine and runs the matmul on ctx.stream(); two launches
 void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,

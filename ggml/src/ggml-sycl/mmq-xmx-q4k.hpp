@@ -44,6 +44,11 @@ bool ggml_sycl_xmx_q4k_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
 // directly by ggml_sycl_mul_mat_xmx_q4k; 1 = legacy, through ggml_sycl_op_mul_mat with the op below (A/B only)
 int ggml_sycl_xmx_q4k_path();
 
+// GGML_SYCL_XMX_Q4K_DIRECT=1 (default 0): 1..8 columns run the register-fed DPAS kernel of mmq-xmx-direct.cpp
+// (bit-identical to the joint_matrix kernel, no SLM staging) instead of the joint_matrix kernel
+bool ggml_sycl_xmx_q4k_direct_env();
+
+
 // the whole mul_mat (1..16 columns) for a src0 already in the reorder layout: quantizes src1 straight into the
 // kernel's operands and runs the matmul on ctx.stream(); two launches
 void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,

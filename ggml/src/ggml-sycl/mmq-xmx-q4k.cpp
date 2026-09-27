@@ -10,6 +10,7 @@
 //
 #include "mmq-xmx-q4k.hpp"
 #include "mmq-dnn-u4.hpp"
+#include "mmq-xmx-direct.hpp"
 #include "quants.hpp"
 #include "quantize.hpp"
 
@@ -48,6 +49,11 @@ bool ggml_sycl_xmx_q4k_env() {
     return v;
 }
 
+bool ggml_sycl_xmx_q4k_direct_env() {
+    static const bool v = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT", 0) != 0;   // default off
+    return v;
+}
+
 int ggml_sycl_xmx_q4k_path() {
     // 0 (default): fused quantize + matmul, launched directly (2 kernels, both in the 256-register mode)
     // 1: legacy, through ggml_sycl_op_mul_mat (q8_1 SoA quantize, pack, matmul: 3 kernels), 1..8 columns only
@@ -60,8 +66,12 @@ static constexpr int XMX_Q4K_ROWS      = 16;
 static constexpr int XMX_Q4K_MAX_COLS  = 16;
 
 static int ggml_sycl_xmx_q4k_min_cols() {
-    // default 3: at 2 columns MMVQ is within a few percent per op and the whole model measured ~5% slower on XMX
-    static const int v = std::max(1, ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_MIN_COLS", 3));
+    // default 3: at 2 columns MMVQ is within a few percent per op and the whole model measured ~5% slower on XMX.
+    // With the direct kernel (GGML_SYCL_XMX_Q4K_DIRECT=1) the default is 2 (test-backend-ops perf, us, MMVQ vs direct
+    // at 2 columns: 17408x5120 102.3 / 94.2, 12288x5120 62.7 / 58.9, 10240x5120 55.2 / 35.2, 6144x5120 37.6 / 15.7,
+    // 5120x6144 41.3 / 15.8); 1 column stays on MMVQ (17408x5120 85.4 vs 91.5)
+    static const int v = std::max(1, ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_MIN_COLS",
+                                                                ggml_sycl_xmx_q4k_direct_env() ? 2 : 3));
     return v;
 }
 
@@ -200,7 +210,10 @@ constexpr int XQ_RS    = 16 / XQ_GP;            // rows covered by one 16-lane x
 // It runs in the 256-register mode of the matmul: every switch between a 128- and a 256-register kernel costs the
 // B70 ~6.5 us (an empty 128-GRF kernel ahead of the matmul adds 6.8 us per op, an empty 256-GRF one 0.5 us), so a
 // default-mode quantizer made each op pay two switches.
-sycl::event xmx_q4k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int32_t * us, int K, int M, sycl::queue & q) {
+// gmajor: xa in the direct kernel's group-major layout [G][16][32] (column c of group g at (g*16 + c)*32) instead of
+// [16][K]; d8 and us are the same either way
+sycl::event xmx_q4k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int32_t * us, int K, int M, sycl::queue & q,
+                              bool gmajor = false) {
     constexpr int GRF = 256;
     constexpr int EPW = QK8_1 / WARP_SIZE;
     const int G = K / QK8_1;
@@ -217,7 +230,9 @@ sycl::event xmx_q4k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
         for (int i = 0; i < EPW; ++i) { s += (int) qv[i]; }
         s = sycl::reduce_over_group(it.get_sub_group(), s, sycl::plus<int>());
         // xa row c holds column c's K quants contiguously: offset c*K + g*QK8_1 = blk*QK8_1
-        *reinterpret_cast<sycl::vec<int8_t, EPW> *>(xa + blk * QK8_1 + (size_t) lane * EPW) = qv;
+        // (group-major: c = blk / G, g = blk % G -> (g*16 + c)*QK8_1)
+        const size_t xo = gmajor ? ((blk % G) * XQ_TN + blk / G) * QK8_1 : blk * QK8_1;
+        *reinterpret_cast<sycl::vec<int8_t, EPW> *>(xa + xo + (size_t) lane * EPW) = qv;
         if (lane == 0) {
             d8[blk] = sycl::half(d);   // [c][G] with c*G + g = blk
             us[blk] = s;
@@ -645,12 +660,50 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
         q = pq;
     }
 
+    // register-fed DPAS kernel for 1..8 columns (GGML_SYCL_XMX_Q4K_DIRECT=1): same partition (split-K) and operation
+    // order as xmx_q4k_matmul, so bit-identical; very tall weights (a 98k-row draft head, where the rule of thumb gives
+    // ks = 1) get ks 5: 530 -> 493 us on 98304x5120, not bit-identical to ks 1 there (float order of 5 partial sums)
+    const bool direct = ggml_sycl_xmx_q4k_direct_env() && M <= 8;
     std::vector<sycl::event> ev;
-    ev.push_back(xmx_q4k_quant_act(x, xa, d8, us, (int) K, (int) M, *q));
-    if (checkq) {
+    ev.push_back(xmx_q4k_quant_act(x, xa, d8, us, (int) K, (int) M, *q, direct));
+    if (checkq && !direct) {
         xmx_q4k_checkq(x, xa, d8, us, (int) K, (int) M, ctx, *q);
     }
-    ev.push_back(xmx_q4k_matmul(w, xa, d8, us, out, (int) N, (int) K, (int) M, dst->ne[0], *q));
+    if (direct) {
+        int ks = xmx_q4k_pick_ks((int) N, (int) K, (int) M);
+        if (N >= 65536 && ks < 5) {
+            ks = std::max(1, std::min(5, (int) (K / QK_K) / 4));
+        }
+        ev.push_back(ggml_sycl_xmx_q4k_direct_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
+                                                     dst->ne[0], ks, *q));
+        // GGML_SYCL_XMX_Q4K_DIRECT_CHECK=1 (measurement only, synchronous): rerun the op on the joint_matrix kernel
+        // (same split-K) and compare every output bit for bit
+        static const bool dcheck = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT_CHECK", 0) != 0;
+        if (dcheck) {
+            ggml_sycl_pool_alloc<char> ref_act(ctx.pool(), xa_bytes + d8_bytes + us_bytes);
+            ggml_sycl_pool_alloc<float> ref_out(ctx.pool(), (size_t) M * N);
+            int8_t *     rxa = reinterpret_cast<int8_t *>(ref_act.get());
+            sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa_bytes);
+            int32_t *    rus = reinterpret_cast<int32_t *>(ref_act.get() + xa_bytes + d8_bytes);
+            xmx_q4k_quant_act(x, rxa, rd8, rus, (int) K, (int) M, *q, false);
+            xmx_q4k_launch<8, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
+            q->wait();
+            std::vector<float> a((size_t) M * N), r((size_t) M * N);
+            for (int64_t i = 0; i < M; ++i) {
+                q->memcpy(a.data() + i * N, out + i * dst->ne[0], N * sizeof(float));
+            }
+            q->memcpy(r.data(), ref_out.get(), r.size() * sizeof(float)).wait();
+            size_t nd = 0;
+            for (size_t i = 0; i < a.size(); ++i) { nd += memcmp(&a[i], &r[i], sizeof(float)) != 0; }
+            static std::atomic<int> n_ok{ 0 }, n_bad{ 0 };
+            (nd == 0 ? n_ok : n_bad)++;
+            fprintf(stderr, "XMXDIRECTCHECK q4_K N=%lld K=%lld M=%lld ks=%d: %s (%zu of %zu differ; ok %d, mismatched %d)\n",
+                    (long long) N, (long long) K, (long long) M, ks, nd == 0 ? "IDENTICAL" : "MISMATCH", nd, a.size(),
+                    (int) n_ok, (int) n_bad);
+        }
+    } else {
+        ev.push_back(xmx_q4k_matmul(w, xa, d8, us, out, (int) N, (int) K, (int) M, dst->ne[0], *q));
+    }
     if (prof) {
         q->wait();
         xmx_q4k_prof_add((int) N, (int) K, (int) M, ev);

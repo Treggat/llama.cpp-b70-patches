@@ -25,6 +25,7 @@ ggml_add_backend_library(ggml-sycl
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
+list(REMOVE_ITEM GGML_SOURCES_SYCL ${CMAKE_CURRENT_SOURCE_DIR}/mmq-xmx-direct.cpp)   # own library (GGML_SYCL_XMX)
 file(GLOB   SRCS "template-instances/fattn-tile*.cpp")
 list(APPEND GGML_SOURCES_SYCL ${SRCS})
 file(GLOB   SRCS "template-instances/fattn-vec*.cpp")
@@ -170,6 +171,13 @@ target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 if (GGML_SYCL_XMX)
     message(STATUS "SYCL XMX q4_K/q6_K + flash-attention paths: enabled")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX=1)
+    # register-fed DPAS kernels (mmq-xmx-direct.cpp, GGML_SYCL_XMX_Q4K_DIRECT / _Q6K_DIRECT) in their own library:
+    # they call an OpenCL builtin that the device-image-dependency linking of ggml-sycl would treat as an import
+    add_library(ggml-sycl-xmxd SHARED ${CMAKE_CURRENT_SOURCE_DIR}/mmq-xmx-direct.cpp)
+    target_compile_options(ggml-sycl-xmxd PRIVATE -fsycl)
+    target_link_options(ggml-sycl-xmxd PRIVATE -fsycl)
+    target_link_libraries(ggml-sycl PRIVATE ggml-sycl-xmxd)
+    install(TARGETS ggml-sycl-xmxd LIBRARY)
     # LOCAL: the fused prefill kernel behind dq-gemm.cpp (GGML_SYCL_DQ_GEMM=1); without it dq-gemm runs its reference
     if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/dq-gemm-kernel/dq_gemm_q4k.cpp)
         message(STATUS "SYCL XMX dq-gemm fused q4_K prefill kernel: enabled")

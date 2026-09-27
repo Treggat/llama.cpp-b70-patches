@@ -11527,7 +11527,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // LOCAL: 8 chained 27B-class FFN blocks (q4_K) at verify column counts
     // (nw 1: rms_norm x weight, the model's fused norm kernel)
     for (int nw : { 0, 1 }) {
-        for (int nc : { 1, 4, 6 }) {
+        for (int nc : { 1, 2, 3, 4, 6, 8 }) {   // LOCAL (q4kalu): + 2, 3, 8 (the XMX window floor and top)
             test_cases.emplace_back(new test_ffn_chain(GGML_TYPE_Q4_K, 5120, 17408, nc, 8, nw));
         }
     }

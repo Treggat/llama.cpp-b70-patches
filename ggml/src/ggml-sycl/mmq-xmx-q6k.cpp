@@ -6,6 +6,7 @@
 //
 #include "mmq-xmx-q6k.hpp"
 #include "mmq-xmx-q4k.hpp"
+#include "mmq-xmx-direct.hpp"
 #include "quants.hpp"
 #include "quantize.hpp"
 
@@ -33,12 +34,19 @@ bool ggml_sycl_xmx_q6k_env() {
     return v;
 }
 
+bool ggml_sycl_xmx_q6k_direct_env() {
+    static const bool v = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT", 0) != 0;   // default off
+    return v;
+}
+
 // kernel tile: 16 weight rows per sub-group, up to 8 activation columns (the A tile's M)
 static constexpr int XMX_Q6K_ROWS     = 16;
 static constexpr int XMX_Q6K_MAX_COLS = 8;
 
 static int ggml_sycl_xmx_q6k_min_cols() {
-    static const int v = std::max(1, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MIN_COLS", 3));
+    // direct kernel (GGML_SYCL_XMX_Q6K_DIRECT=1): 2, for weights of at least BIG_MB only (see can_use)
+    static const int v = std::max(1, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MIN_COLS",
+                                                                ggml_sycl_xmx_q6k_direct_env() ? 2 : 3));
     return v;
 }
 
@@ -65,7 +73,10 @@ static size_t ggml_sycl_xmx_q6k_big_bytes() {
 }
 
 static int ggml_sycl_xmx_q6k_small_min_cols() {
-    static const int v = std::max(1, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_SMALL_MIN_COLS", 5));
+    // direct kernel: 3 (test-backend-ops perf, us, 10240x5120 MMVQ vs direct at 3 / 4 columns: 91.4 / 81.3, 108.6 / 81.9;
+    // at 2 columns MMVQ 77.0 vs 80.5)
+    static const int v = std::max(1, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_SMALL_MIN_COLS",
+                                                                ggml_sycl_xmx_q6k_direct_env() ? 3 : 5));
     return v;
 }
 
@@ -99,6 +110,10 @@ bool ggml_sycl_xmx_q6k_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
         return false;
     }
     if (ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes() && src1->ne[1] < ggml_sycl_xmx_q6k_small_min_cols()) {
+        return false;
+    }
+    // direct kernel at 2 columns: only weights of at least BIG_MB (5120x17408 ffn_down: MMVQ 152.0 vs direct 140.9 us)
+    if (src1->ne[1] < 3 && ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes()) {
         return false;
     }
     // with DMMV prioritised the reorder of K-quants is not used by the rest of the backend
@@ -167,7 +182,10 @@ void xmx_q6k_pack_act(const char * y, size_t stride_y, int8_t * xa, sycl::half *
 // straight into the xa / d8 layout above. Runs in the matmul's 256-register mode, so the op pays no register-mode
 // switch between its two kernels (the legacy path ran a 128-GRF quantize, a default-GRF pack and the 256-GRF matmul).
 // Columns >= M are left unwritten: they only feed accumulator rows the kernel never stores (integer DPAS, per-row).
-sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int K, int M, sycl::queue & q) {
+// gmajor: xa in the direct kernel's group-major layout [G][2 tiles][8 columns][32]: tile 0 = elements 0..15 then 16
+// zeros, tile 1 = 16 zeros then elements 16..31 (the same two A tiles, 512 B per group, one block read each)
+sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int K, int M, sycl::queue & q,
+                              bool gmajor = false) {
     constexpr int EPW = QK8_1 / WARP_SIZE;
     static_assert(EPW * WARP_SIZE == QK8_1 && 16 % EPW == 0, "lane split of a 32-group");
     const int G = K / QK8_1;
@@ -182,10 +200,16 @@ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
         const int    g    = (int) (blk % G);
         const int    lane = (int) it.get_local_id(0);
         const int    e    = lane * EPW;        // this lane's first element of the group
-        int8_t * dst = xa + (size_t) c * 2 * K + (size_t) g * 64;
-        // elements 0..15 at +0, 16..31 at +48; bytes 16..47 zero (EPW per lane covers 32 bytes over the sub-group)
-        *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? e : e + 32)) = qv;
-        *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + 16 + e) = sycl::vec<int8_t, EPW>(0);
+        if (gmajor) {
+            int8_t * dst = xa + (size_t) g * 512 + (size_t) c * 32;
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 0 : 256) + e) = qv;
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 256 : 0) + e) = sycl::vec<int8_t, EPW>(0);
+        } else {
+            int8_t * dst = xa + (size_t) c * 2 * K + (size_t) g * 64;
+            // elements 0..15 at +0, 16..31 at +48; bytes 16..47 zero (EPW per lane covers 32 bytes over the sub-group)
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? e : e + 32)) = qv;
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + 16 + e) = sycl::vec<int8_t, EPW>(0);
+        }
         if (lane == 0) {
             d8[(size_t) g * X6_TM + c] = sycl::half(d);
         }
@@ -493,13 +517,54 @@ void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tenso
 
     sycl::queue & q = *ctx.stream();
     const float * x = static_cast<const float *>(src1->data);
-    xmx_q6k_quant_act(x, xa, d8, (int) K, (int) M, q);
+    const bool direct = ggml_sycl_xmx_q6k_direct_env();
+    xmx_q6k_quant_act(x, xa, d8, (int) K, (int) M, q, direct);
     static const bool checkq = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_CHECKQ", 0) != 0;
-    if (checkq) {
+    if (checkq && !direct) {
         xmx_q6k_checkq(x, xa, d8, (int) K, (int) M, ctx, q);
     }
-    xmx_q6k_launch(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N, (int) K, (int) M,
-                   dst->ne[0], xmx_q6k_pick_ks((int) N, (int) K), q);
+    if (direct) {
+        // split-K: the joint_matrix kernel's, except ffn_down 5120x17408 (68 blocks per row) where the register-fed
+        // kernel is fastest at 16 (B70 probe, us at 8 columns: ks 3 156.7, 10 147.2, 12 146.2, 16 142.9; the
+        // joint_matrix kernel: 3 155.7, 10 158.5, 16 159.8). Same ks = bit-identical to the joint_matrix kernel.
+        static const int ks_env = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_KS", -1);
+        int ks = xmx_q6k_pick_ks((int) N, (int) K);
+        if (ks_env < 0 && (K / QK_K) >= 64 && N <= 8192) {
+            ks = 16;
+        } else if (ks_env > 0) {
+            ks = std::min(ks_env, (int) (K / QK_K));
+        }
+        ggml_sycl_xmx_q6k_direct_launch(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N,
+                                        (int) K, (int) M, dst->ne[0], ks, q);
+        // GGML_SYCL_XMX_Q6K_DIRECT_CHECK=1 (measurement only, synchronous): rerun the op on the joint_matrix kernel
+        // (same split-K) and compare every output bit for bit
+        static const bool dcheck = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_CHECK", 0) != 0;
+        if (dcheck) {
+            ggml_sycl_pool_alloc<char>  ref_act(ctx.pool(), xa_bytes + d8_bytes);
+            ggml_sycl_pool_alloc<float> ref_out(ctx.pool(), (size_t) M * N);
+            int8_t *     rxa = reinterpret_cast<int8_t *>(ref_act.get());
+            sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa_bytes);
+            xmx_q6k_quant_act(x, rxa, rd8, (int) K, (int) M, q, false);
+            xmx_q6k_launch(w.ql, w.qh, w.sc, w.dd, rxa, rd8, ref_out.get(), (int) N, (int) K, (int) M, N, ks, q);
+            q.wait();
+            std::vector<float> a((size_t) M * N), r((size_t) M * N);
+            const float * out = static_cast<const float *>(dst->data);
+            for (int64_t i = 0; i < M; ++i) {
+                q.memcpy(a.data() + i * N, out + i * dst->ne[0], N * sizeof(float));
+            }
+            q.memcpy(r.data(), ref_out.get(), r.size() * sizeof(float)).wait();
+            size_t nd = 0;
+            for (size_t i = 0; i < a.size(); ++i) { nd += memcmp(&a[i], &r[i], sizeof(float)) != 0; }
+            static std::atomic<int> n_ok{ 0 }, n_bad{ 0 };
+            (nd == 0 ? n_ok : n_bad)++;
+            fprintf(stderr, "XMXDIRECTCHECK q6_K N=%lld K=%lld M=%lld ks=%d: %s (%zu of %zu differ; ok %d, mismatched %d)\n",
+                    (long long) N, (long long) K, (long long) M, ks, nd == 0 ? "IDENTICAL" : "MISMATCH", nd, a.size(),
+                    (int) n_ok, (int) n_bad);
+        }
+    } else {
+        xmx_q6k_launch(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N, (int) K, (int) M,
+                       dst->ne[0], xmx_q6k_pick_ks((int) N, (int) K), q);
+    }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
