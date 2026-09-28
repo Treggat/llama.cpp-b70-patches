@@ -1533,6 +1533,31 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // LOCAL (prefill-gdn): TBO_ERRSTATS=1 prints per-node error stats (GATED_DELTA_NET: attention / state parts)
+            static const bool errstats = getenv("TBO_ERRSTATS") != nullptr;
+            if (errstats) {
+                auto stats = [&](const char * part, size_t i0, size_t i1) {
+                    double se = 0.0, sr = 0.0, mad = 0.0, mref = 0.0;
+                    for (size_t i = i0; i < i1; ++i) {
+                        const double d = (double) f1[i] - (double) f2[i];
+                        se += d * d;
+                        sr += (double) f2[i] * f2[i];
+                        mad  = std::max(mad, std::fabs(d));
+                        mref = std::max(mref, std::fabs((double) f2[i]));
+                    }
+                    printf("[errstats] %s %s n=%zu nmse=%.3e maxabs=%.3e maxref=%.3e maxabs/maxref=%.3e rms_rel=%.3e\n",
+                           ggml_op_desc(t1), part, i1 - i0, sr > 0 ? se / sr : 0.0, mad, mref,
+                           mref > 0 ? mad / mref : 0.0, sr > 0 ? std::sqrt(se / sr) : 0.0);
+                };
+                if (t1->op == GGML_OP_GATED_DELTA_NET) {
+                    const ggml_tensor * v = t1->src[2];
+                    const size_t na = (size_t) (v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3]);
+                    stats("attn", 0, std::min(na, f1.size()));
+                    stats("state", std::min(na, f1.size()), f1.size());
+                } else {
+                    stats("all", 0, f1.size());
+                }
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -11080,6 +11105,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_gather(48, 128, 8, 8, 1, 3));
     test_cases.emplace_back(new test_gdn_gather(4, 64, 5, 3, 3, 4));
+    // LOCAL (prefill-gdn): gather + snapshot planes at prefill lengths (SYCL chunked GDN)
+    for (int64_t n : { 64, 300 }) {
+        for (int64_t row_in : { 0, 2 * 2, 7 * 2 + 1 }) {
+            test_cases.emplace_back(new test_gdn_gather(4, 128, n, 8, 2, row_in));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_gather(48, 128, 1000, 8, 1, 3));
     // LOCAL (xmx-fa probe): Qwen3.8-27B seat decode/verify shapes, real KV-cache layout.
     for (int kv : { 4096, 32768, }) {
         for (int nb : { 1, 2, 4, 6, 8, }) {
@@ -11408,6 +11440,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // LOCAL (prefill-gdn): SYCL chunked GDN (GGML_SYCL_GDN_CHUNKED=1, threshold GGML_SYCL_GDN_CHUNKED_MIN): house head
+    // config (16 k-heads x3 v-repeat, d128), whole / partial chunks, K rollback slots incl. a tail that spans chunks
+    for (int64_t n : { 63, 64, 65, 100, 128, 255, 256, 300, 1000, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+    }
+    for (int64_t n : { 64, 67, 71, 72, 130, 1000 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, /*K=*/8));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 3, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 300, 1, 3, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 300, 2, 1, true, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 130, 1, 1, false, true));   // KDA: sequential
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
@@ -11439,6 +11484,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 300, 1, 4));   // LOCAL (prefill-gdn)
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128, 130, 2, 8));   // LOCAL (prefill-gdn)
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -11548,6 +11595,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // LOCAL (prefill-gdn): house GDN layer at prefill ubatch lengths (SYCL chunked GDN vs token-sequential)
+    for (int64_t n : { 64, 128, 256, 512, 1024, 2048 }) {
+        for (int64_t K : { 1, 8 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, K));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_gather(48, 128, 2048, 8, 1, 3));
     // LOCAL: qwen35 recurrent-state gather + 8 rollback snapshots, 48 heads x 128 (SYCL GGML_SYCL_GDN_GATHER)
     for (int64_t n : { 1, 8 }) {
         test_cases.emplace_back(new test_gdn_gather(48, 128, n, 8, 1, 3));

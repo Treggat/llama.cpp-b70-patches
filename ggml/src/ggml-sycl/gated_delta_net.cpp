@@ -342,6 +342,14 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         state_slot_stride = cache->slot_stride;
     }
 
+    // LOCAL (prefill-gdn): chunked kernel for long ubatches (GGML_SYCL_GDN_CHUNKED=1)
+    if (ggml_sycl_gdn_chunked_enabled(S_v, kda, n_tokens, K < 1 ? 1 : K) &&
+        ggml_sycl_gdn_chunked_launch(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2,
+                                     sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride,
+                                     K < 1 ? 1 : K, s_idx, s_row)) {
+        return;
+    }
+
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
