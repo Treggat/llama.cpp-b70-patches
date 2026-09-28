@@ -483,6 +483,7 @@ static void ggml_check_sycl() try {
         } else {
             GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_fattn_xmx_env());
         }
+        GGML_LOG_INFO("  GGML_SYCL_XMX_FA_Q8: %d\n", (int) ggml_sycl_fattn_xmx_q8_env());
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MAX_KV: %d\n", g_ggml_sycl_fa_onednn_max_kv);
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);

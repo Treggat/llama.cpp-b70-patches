@@ -5,6 +5,7 @@
 #include "llama-memory.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -20,6 +21,16 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd
     }
 
     seq_idx.resize(LLAMA_MAX_SEQ, -1);
+}
+
+// [draftcost] env LLAMA_BALLOC_FAST=1 (default 0): skip the per-decode LLAMA_MAX_SEQ^2 coupled-sequence reset and
+// scan when the batch couples no sequences (validation and results unchanged)
+static bool llama_balloc_fast() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_BALLOC_FAST");
+        return e && atoi(e) != 0;
+    }();
+    return on;
 }
 
 bool llama_batch_allocr::init(
@@ -320,7 +331,9 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (memory) {
+    // [draftcost] LLAMA_BALLOC_FAST=1: seq_cpl is only ever set together with has_cpl, so without coupled sequences in
+    // this batch the n_seq_max^2 scan (65536 checks with a unified KV cache, every decode) finds nothing: skip it
+    if (memory && (!llama_balloc_fast() || has_cpl)) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
@@ -735,8 +748,12 @@ void llama_batch_allocr::clear() {
         cur.clear();
     }
 
-    for (auto & cur : seq_cpl) {
-        std::fill(cur.begin(), cur.end(), false);
+    // [draftcost] LLAMA_BALLOC_FAST: has_cpl still describes the previous batch here; if it had no coupled sequences,
+    // no seq_cpl entry was set and the LLAMA_MAX_SEQ^2 reset is a no-op
+    if (!llama_balloc_fast() || has_cpl) {
+        for (auto & cur : seq_cpl) {
+            std::fill(cur.begin(), cur.end(), false);
+        }
     }
 
     seq_set.clear();

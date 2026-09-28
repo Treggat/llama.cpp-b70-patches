@@ -2076,6 +2076,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+        const int64_t hp_ex_t0 = hp_dec ? ggml_time_us() : 0; // [draftcost] output extraction enqueue
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2092,7 +2093,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const int64_t n_lg = t_logits->ne[0];
+                if (n_lg == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // [draftcost] a narrower logits tensor (MTP draft head, LLAMA_MTP_DRAFT_NOPAD): the ids >= n_lg
+                    // can never be drawn, so each row's tail reads -inf, as the padded graph's -1e30 did for any top-k
+                    GGML_ASSERT(n_lg < n_vocab && t_logits->nb[1] == (size_t) n_lg*sizeof(float));
+                    for (int64_t r = 0; r < n_outputs; ++r) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + r*n_vocab,
+                                r*n_lg*sizeof(float), n_lg*sizeof(float));
+                        std::fill(logits_out + r*n_vocab + n_lg, logits_out + (r + 1)*n_vocab, -INFINITY);
+                    }
+                }
             }
         }
 
@@ -2185,6 +2198,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+        if (hp_ex_t0) {
+            llama_hprof_add(hp_dec_tag + ".extract", hp_ex_t0);
         }
 
         n_outputs_prev += n_outputs;

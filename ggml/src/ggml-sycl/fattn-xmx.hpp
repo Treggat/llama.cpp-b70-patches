@@ -20,6 +20,10 @@
 // value of the GGML_SYCL_XMX_FA env switch (default 0), read once
 bool ggml_sycl_fattn_xmx_env();
 
+// value of the GGML_SYCL_XMX_FA_Q8 env switch (default 0, LOCAL): the same kernel structure for a q8_0 K/V cache
+// (2D int8 block loads, dequantized to f16 in registers), 1..8 query tokens (GGML_SYCL_XMX_FA_Q8_MIN_COLS / _MAX_COLS)
+bool ggml_sycl_fattn_xmx_q8_env();
+
 // true when the device has f16 matrix hardware for this kernel; probed once per device and cached
 bool ggml_sycl_fattn_xmx_device_ok(int device);
 

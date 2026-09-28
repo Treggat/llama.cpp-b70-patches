@@ -654,7 +654,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     } else if (n_sub_env > 0 && n_sub_env < n_vocab_head && !ggml_is_quantized(head_w->type)) {
         head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_sub_env, head_w->nb[1], 0);
     }
-    if (head_sub) {
+    // [draftcost] LLAMA_MTP_DRAFT_NOPAD=1 (default off): leave the draft logits n_sub wide instead of padding them to
+    // the full vocab with -1e30. Ids < n_sub keep their column, so the draft sampler's top-k (backend top-k over n_sub
+    // columns instead of n_vocab, or the host path, where llama_context fills the tail of each row with -inf) selects
+    // exactly the same candidates; it saves the fill/pad/scale/add chain and 60% of the top-k scan per draft token.
+    static const bool no_pad = getenv("LLAMA_MTP_DRAFT_NOPAD") && atoi(getenv("LLAMA_MTP_DRAFT_NOPAD")) != 0;
+    if (head_sub && no_pad) {
+        cur = build_lora_mm(head_sub, cur, head_sub == layer.nextn.draft_head ? nullptr : head_s);
+    } else if (head_sub) {
         cur = build_lora_mm(head_sub, cur, head_sub == layer.nextn.draft_head ? nullptr : head_s);
         const int n_pad = (int) (n_vocab_head - head_sub->ne[1]);
         // 1 over the subset, 0 over the padded tail -> bias 0 / -1e30 (fill needs a contiguous tensor, so no view)

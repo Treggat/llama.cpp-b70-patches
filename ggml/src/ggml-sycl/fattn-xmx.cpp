@@ -28,6 +28,13 @@ bool ggml_sycl_fattn_xmx_env() {
     return v;
 }
 
+// GGML_SYCL_XMX_FA_Q8=1 (LOCAL, default off): the XMX decode/verify kernel for a q8_0 KV cache (-ctk q8_0 -ctv q8_0).
+// Independent of GGML_SYCL_XMX_FA (which gates the f16 kernel); without it a q8_0 cache runs on the TILE kernel.
+bool ggml_sycl_fattn_xmx_q8_env() {
+    static const bool v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_Q8", 0) != 0;
+    return v;
+}
+
 // kernel geometry (xmx_fa.cpp): 8 sub-groups of 16 lanes, 8 tokens per sub-group per iteration
 static constexpr int XFA_D    = 256;             // head dim, K and V
 static constexpr int XFA_SG   = 16;
@@ -50,13 +57,31 @@ static int ggml_sycl_fattn_xmx_max_cols() {
     return v;
 }
 
+// GGML_SYCL_XMX_FA_DRAFT_N1=1 (LOCAL, default off): run the f16 XMX kernel at 1 query token too, but only for an MTP
+// draft context's attention (tagged by llama-graph in op_params[15]); the target's 1-token decodes stay on TILE, so
+// target outputs are unchanged. Measured 471 vs 494 us (TILE) per draft token at kv 65536, 587 vs 609 at 81920.
+static bool ggml_sycl_fattn_xmx_draft_n1() {
+    static const bool v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_DRAFT_N1", 0) != 0;
+    return v;
+}
+
+static bool ggml_sycl_fattn_is_mtp_draft(const ggml_tensor * dst) {
+    return dst->op_params[15] == 0x4D545044;
+}
+
+static int ggml_sycl_fattn_xmx_q8_min_cols() {
+    // default 1: the q8_0 kernel beats TILE on q8_0 at 1 token too (TILE dequantizes the whole cache to f16 first)
+    static const int v = std::max(1, ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_Q8_MIN_COLS", 1));
+    return v;
+}
+
 bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
 #if !GGML_SYCL_XMX
     GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #else
-    if (!ggml_sycl_fattn_xmx_env() || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
     const ggml_tensor * Q     = dst->src[0];
@@ -67,7 +92,11 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
     if (!Q || !K || !V || !mask || sinks) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+    const bool q8 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (q8 ? !ggml_sycl_fattn_xmx_q8_env() : !ggml_sycl_fattn_xmx_env()) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || (!q8 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) ||
         mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -86,7 +115,9 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
     }
     const int64_t nb = Q->ne[1];
     const int64_t kv = K->ne[1];
-    if (nb < ggml_sycl_fattn_xmx_min_cols() || nb > ggml_sycl_fattn_xmx_max_cols()) {
+    const int min_cols = q8 ? ggml_sycl_fattn_xmx_q8_min_cols()
+                            : (ggml_sycl_fattn_xmx_draft_n1() && ggml_sycl_fattn_is_mtp_draft(dst)) ? 1 : ggml_sycl_fattn_xmx_min_cols();
+    if (nb < min_cols || nb > ggml_sycl_fattn_xmx_max_cols()) {
         return false;
     }
     if (K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != kv) {
@@ -103,7 +134,9 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
         return false;
     }
     // element-contiguous rows; the K/V row loads are 2D block loads from global: 64 B aligned base and pitches
-    if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(sycl::half) || V->nb[0] != sizeof(sycl::half) ||
+    // (q8_0: 2D int8 block loads at 4-byte aligned starts, pitch a multiple of 16 B, >= 64 B; blocks contiguous)
+    const size_t kv_elt = q8 ? ggml_type_size(GGML_TYPE_Q8_0) : sizeof(sycl::half);
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != kv_elt || V->nb[0] != kv_elt ||
         mask->nb[0] != sizeof(sycl::half) || dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -112,7 +145,11 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
         return false;
     }
     for (const ggml_tensor * t : { K, V }) {
-        if (t->nb[1] % 64 != 0 || t->nb[2] % 64 != 0 || ((uintptr_t) t->data) % 64 != 0) {
+        if (q8) {
+            if (t->nb[1] % 16 != 0 || t->nb[1] < 64 || t->nb[2] % 4 != 0 || ((uintptr_t) t->data) % 16 != 0) {
+                return false;
+            }
+        } else if (t->nb[1] % 64 != 0 || t->nb[2] % 64 != 0 || ((uintptr_t) t->data) % 64 != 0) {
             return false;
         }
     }
@@ -183,6 +220,8 @@ struct xfa_params {
     int chunk, nchunks;
     float scale;
     int qs, Rw;                 // query-row splits per (KV head, chunk) and rows per split (R = qs * Rw)
+    const uint8_t * K8; const uint8_t * V8;   // q8_0 kernel: K / V
+    int64_t k8_s1, k8_s2, v8_s1, v8_s2;       // q8_0 kernel: K / V strides (bytes): token, head
 };
 
 // One work-group of NSG sub-groups per (KV head, KV chunk, query split). Per iteration of T = 64 tokens:
@@ -465,6 +504,280 @@ void xfa_run(sycl::queue & q, const xfa_params & p) {
     }
 }
 
+// ---- q8_0 K/V (GGML_SYCL_XMX_FA_Q8=1) ----
+// Same structure, launch policy (FA_V2) and combine as the f16 kernel above; K and V are read as q8_0 blocks
+// (34 B: f16 scale + 32 x int8) with 2D int8 block loads and dequantized in registers:
+//   1. S^T = K Q^T: per q8_0 block b the 8 tokens x 32 quants are one int8 A tile (a 2D block load; these need a
+//      4-byte aligned start: odd blocks are loaded at their quants (34b+2), even blocks at their scale (34b) plus a
+//      second tile for the last two quants), converted to two f16 A tiles (8 tok x 16 d; the d order inside a block
+//      is permuted so the conversion stays inside each work-item, Q^T is staged in the same order) and scaled by the
+//      per-token block scale.
+//   2. online softmax, as above.
+//   3. O += P V for the sub-group's 32 dv (= q8_0 block s of each token): int8 B tiles (32 tok x 16 quants) -> f16
+//      B tiles (16 tok x 16 dv, per-token scale); the dv order is permuted the same way and undone when O is stored.
+// joint_matrix element maps (probed on the B70): f16 A 8x16 / B 16x16: element e = row e; int8 A 8x32: element 2r+j =
+// (row r, col 2c+j); int8 B 32x16: element e = row e. Column-dependent choices use the apply coordinates.
+static constexpr int XFA_QB = 34;   // q8_0 block bytes
+// quant index held by column c of the f16 tile h (0/1) built from an int8 tile loaded at the 4-byte aligned start:
+// odd block: tile starts at the quants -> 2c + h; even block: tile starts at the scale -> 2(c-1) + h, column 0 takes
+// quants 30/31 from the second tile
+static inline int xfa_q8_kperm(int b, int c, int h) { return (b & 1) ? 2 * c + h : 2 * ((c + 15) & 15) + h; }
+// dv (within the sub-group's block) of column c of f16 B tile nv: odd s -> 16 nv + c; even s -> nv 0: c - 2 (c >= 2)
+// or 30 + c (c < 2), nv 1: 14 + c
+static inline int xfa_q8_vperm(int s, int nv, int c) { return (s & 1) ? 16 * nv + c : (nv ? 14 + c : (c >= 2 ? c - 2 : 30 + c)); }
+
+template <int MT8, int NT16>
+void xfa_launch_main_q8(sycl::queue & q, const xfa_params p) {
+    constexpr int NSG = XFA_NSG, SG = XFA_SG, TPS = XFA_TPS, T = XFA_T, D = XFA_D, DVS = XFA_DVS, QB = XFA_QB;
+    constexpr int R16 = NT16 * 16, R8 = MT8 * 8;
+    constexpr int SST = R16 + 4;
+    constexpr int RPS = (R8 + NSG - 1) / NSG;
+    const int ngroups = p.nhkv * p.nchunks * p.qs;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<half, 1>  Qp(sycl::range<1>(R16 * D), h);
+        sycl::local_accessor<float, 1> St(sycl::range<1>(T * SST), h);
+        sycl::local_accessor<half, 1>  Ps(sycl::range<1>(R8 * T), h);
+        sycl::local_accessor<float, 1> Al(sycl::range<1>(R8), h);
+        sycl::local_accessor<float, 1> Mr(sycl::range<1>(R8), h);
+        sycl::local_accessor<float, 1> Lr(sycl::range<1>(R8), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) ngroups * NSG * SG, NSG * SG),
+            oexp::properties{ sycl::ext::intel::experimental::grf_size<256> },
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int s     = sg.get_group_linear_id();
+            const int lane  = sg.get_local_linear_id();
+            const int tid   = it.get_local_linear_id();
+            const int g     = it.get_group_linear_id();
+            const int split = g % p.qs;
+            const int gh    = g / p.qs;
+            const int hk    = gh % p.nhkv;
+            const int ch    = gh / p.nhkv;
+            const int rbase = split * p.Rw;
+            const int c0    = ch * p.chunk;
+            const int c1    = sycl::min(p.kv, c0 + p.chunk);
+            const float LOG2E = 1.4426950408889634f;
+
+            half  * qp = Qp.get_multi_ptr<decorated::no>().get();
+            float * st = St.get_multi_ptr<decorated::no>().get();
+            half  * ps = Ps.get_multi_ptr<decorated::no>().get();
+            float * al = Al.get_multi_ptr<decorated::no>().get();
+            float * mr = Mr.get_multi_ptr<decorated::no>().get();
+            float * lr = Lr.get_multi_ptr<decorated::no>().get();
+
+            // ---- stage Q^T (scaled, f16, VNNI packed), d permuted per 16-row tile kk = 2b + h ----
+            for (int i = tid; i < R16 * D; i += NSG * SG) {
+                const int r = i / D, k = i % D;                    // k: packed row (tile kk = k / 16, row k % 16)
+                const int kk = k >> 4, b = kk >> 1, hh = kk & 1;
+                const int d = 32 * b + xfa_q8_kperm(b, k & 15, hh);
+                float v = 0.f;
+                if (r < p.Rw) {
+                    const int rg = rbase + r;
+                    const int t = rg / p.ratio, hq = hk * p.ratio + rg % p.ratio;
+                    v = p.Q[t * p.q_s1 + hq * p.q_s2 + d] * p.scale;
+                }
+                qp[(k >> 1) * (2 * R16) + 2 * r + (k & 1)] = (half) v;
+            }
+            for (int r = tid; r < R8; r += NSG * SG) { mr[r] = -1e30f; lr[r] = 0.f; }
+
+            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> O[MT8][2];
+#pragma unroll
+            for (int mt = 0; mt < MT8; ++mt)
+#pragma unroll
+                for (int nv = 0; nv < 2; ++nv) mx::joint_matrix_fill(sg, O[mt][nv], 0.f);
+
+            const uint8_t * Kh = p.K8 + hk * p.k8_s2;
+            const uint8_t * Vh = p.V8 + hk * p.v8_s2 + QB * s;       // this sub-group's block (dv 32 s .. 32 s + 31)
+            const bool sodd = (s & 1) != 0;
+            auto lQp = sycl::address_space_cast<address_space::local_space, decorated::no>(qp);
+            auto lSt = sycl::address_space_cast<address_space::local_space, decorated::no>(st);
+            auto lPs = sycl::address_space_cast<address_space::local_space, decorated::no>(ps);
+            auto gload = [](const uint8_t * ptr) {
+                return sycl::address_space_cast<address_space::global_space, decorated::no>((const int8_t *) ptr);
+            };
+
+            sycl::group_barrier(it.get_group());
+
+            for (int tok0 = c0; tok0 < c1; tok0 += T) {
+                // ---- 1. S^T = K Q^T for this sub-group's 8 tokens ----
+                {
+                    const uint8_t * kb = Kh + (int64_t) (tok0 + s * TPS) * p.k8_s1;
+                    // block scales: lane l -> token l & 7, block 2j + (l >> 3); broadcast by shuffles below
+                    uint32_t ksc[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        ksc[j] = *(const uint16_t *) (kb + (lane & 7) * p.k8_s1 + QB * (2 * j + (lane >> 3)));
+                    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> S[NT16];
+#pragma unroll
+                    for (int nt = 0; nt < NT16; ++nt) mx::joint_matrix_fill(sg, S[nt], 0.f);
+#pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, 8, 32, mx::layout::row_major> K8a, K8b;
+                        mx::joint_matrix_load(sg, K8a, gload(kb + QB * b + ((b & 1) ? 2 : 0)), p.k8_s1);
+                        int8_t ka[16], kz[16];
+                        int e = 0;
+                        imx::joint_matrix_apply(sg, K8a, [&](int8_t & v, size_t, size_t) { ka[e++] = v; });
+                        if (!(b & 1)) {
+                            mx::joint_matrix_load(sg, K8b, gload(kb + QB * b + 32), p.k8_s1);
+                            e = 0;
+                            imx::joint_matrix_apply(sg, K8b, [&](int8_t & v, size_t, size_t) { kz[e++] = v; });
+                        }
+                        half dks[8];
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) {
+                            const int idx = r + 8 * (b & 1);   // lane holding (token r, block b) in ksc[b >> 1]
+                            dks[r] = sycl::bit_cast<half>((uint16_t) sycl::select_from_group(sg, ksc[b >> 1], idx));
+                        }
+#pragma unroll
+                        for (int hh = 0; hh < 2; ++hh) {
+                            const int kk = 2 * b + hh;
+                            mx::joint_matrix<sycl::sub_group, half, mx::use::a, 8, 16, mx::layout::row_major> A;
+                            mx::joint_matrix_fill(sg, A, (half) 0.f);
+                            e = 0;
+                            imx::joint_matrix_apply(sg, A, [&](half & x, size_t, size_t c) {
+                                const int8_t qv = (!(b & 1) && c == 0) ? kz[2 * e + hh] : ka[2 * e + hh];
+                                x = (half) qv * dks[e];
+                                ++e;
+                            });
+#pragma unroll
+                            for (int nt = 0; nt < NT16; ++nt) {
+                                mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::ext_intel_packed> B;
+                                mx::joint_matrix_load(sg, B, lQp + kk * 8 * (2 * R16) + nt * 32, 2 * R16);
+                                mx::joint_matrix_mad(sg, S[nt], A, B, S[nt]);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < NT16; ++nt)
+                        mx::joint_matrix_store(sg, S[nt], lSt + (s * TPS) * SST + nt * 16, SST, mx::layout::row_major);
+                }
+                sycl::group_barrier(it.get_group());
+
+                // ---- 2. online softmax ----
+#pragma unroll
+                for (int ri = 0; ri < RPS; ++ri) {
+                    const int r = s + ri * NSG;
+                    if (r >= R8) continue;
+                    if (r >= p.Rw) {
+                        for (int j = lane; j < T; j += SG) ps[r * T + j] = (half) 0.f;
+                        if (lane == 0) al[r] = 1.f;
+                        continue;
+                    }
+                    const int tq = (rbase + r) / p.ratio;
+                    float x[T / SG];
+                    float mx_ = -INFINITY;
+#pragma unroll
+                    for (int i = 0; i < T / SG; ++i) {
+                        const int j = lane + i * SG;
+                        x[i] = (st[j * SST + r] + (float) p.mask[tq * p.m_s1 + tok0 + j]) * LOG2E;
+                        mx_ = sycl::fmax(mx_, x[i]);
+                    }
+                    mx_ = sycl::reduce_over_group(sg, mx_, sycl::maximum<float>());
+                    const float m_old = mr[r];
+                    const float m_new = sycl::fmax(m_old, mx_);
+                    float sum = 0.f;
+#pragma unroll
+                    for (int i = 0; i < T / SG; ++i) {
+                        const float pe = sycl::exp2(x[i] - m_new);
+                        sum += pe;
+                        ps[r * T + lane + i * SG] = (half) pe;
+                    }
+                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                    if (lane == 0) {
+                        const float a = sycl::exp2(m_old - m_new);
+                        al[r] = a;
+                        mr[r] = m_new;
+                        lr[r] = lr[r] * a + sum;
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+
+                // ---- 3. O = O*alpha + P V for this sub-group's block s ----
+#pragma unroll
+                for (int mt = 0; mt < MT8; ++mt) {
+                    float a[8];
+                    bool any = false;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { a[i] = al[mt * 8 + i]; any |= a[i] != 1.f; }
+                    if (any) {
+#pragma unroll
+                        for (int nv = 0; nv < 2; ++nv)
+                            imx::joint_matrix_apply(sg, O[mt][nv], [&](float & v, size_t row, size_t) { v *= a[row]; });
+                    }
+                }
+#pragma unroll
+                for (int k32 = 0; k32 < T / 32; ++k32) {
+                    const uint8_t * vb = Vh + (int64_t) (tok0 + 32 * k32) * p.v8_s1;
+                    // per-token scales of block s: lane l -> token 32 k32 + 16 j + l
+                    uint32_t vsc[2];
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) vsc[j] = *(const uint16_t *) (vb + (16 * j + lane) * p.v8_s1);
+                    mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, 32, 16, mx::layout::row_major> V0, V1, V2;
+                    mx::joint_matrix_load(sg, V0, gload(vb + (sodd ? 2 : 0)), p.v8_s1);
+                    mx::joint_matrix_load(sg, V1, gload(vb + (sodd ? 18 : 16)), p.v8_s1);
+                    int8_t v0[32], v1[32], v2[32];
+                    int e = 0;
+                    imx::joint_matrix_apply(sg, V0, [&](int8_t & v, size_t, size_t) { v0[e++] = v; });
+                    e = 0;
+                    imx::joint_matrix_apply(sg, V1, [&](int8_t & v, size_t, size_t) { v1[e++] = v; });
+                    if (!sodd) {
+                        mx::joint_matrix_load(sg, V2, gload(vb + 32), p.v8_s1);
+                        e = 0;
+                        imx::joint_matrix_apply(sg, V2, [&](int8_t & v, size_t, size_t) { v2[e++] = v; });
+                    }
+#pragma unroll
+                    for (int th = 0; th < 2; ++th) {
+                        const int kk = 2 * k32 + th;
+                        half dvs[16];
+#pragma unroll
+                        for (int i = 0; i < 16; ++i)
+                            dvs[i] = sycl::bit_cast<half>((uint16_t) sycl::select_from_group(sg, vsc[th], i));
+                        mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::ext_intel_packed> B[2];
+#pragma unroll
+                        for (int nv = 0; nv < 2; ++nv) {
+                            mx::joint_matrix_fill(sg, B[nv], (half) 0.f);
+                            e = 0;
+                            imx::joint_matrix_apply(sg, B[nv], [&](half & x, size_t, size_t c) {
+                                const int i = 16 * th + e;
+                                const int8_t qv = nv ? v1[i] : ((!sodd && c < 2) ? v2[i] : v0[i]);
+                                x = (half) qv * dvs[e];
+                                ++e;
+                            });
+                        }
+#pragma unroll
+                        for (int mt = 0; mt < MT8; ++mt) {
+                            mx::joint_matrix<sycl::sub_group, half, mx::use::a, 8, 16, mx::layout::row_major> A;
+                            mx::joint_matrix_load(sg, A, lPs + mt * 8 * T + kk * 16, T);
+#pragma unroll
+                            for (int nv = 0; nv < 2; ++nv) mx::joint_matrix_mad(sg, O[mt][nv], A, B[nv], O[mt][nv]);
+                        }
+                    }
+                }
+            }
+
+            // ---- partials (dv order restored) ----
+            float * op = p.Opart + (int64_t) g * R8 * D + DVS * s;
+#pragma unroll
+            for (int mt = 0; mt < MT8; ++mt)
+#pragma unroll
+                for (int nv = 0; nv < 2; ++nv)
+                    imx::joint_matrix_apply(sg, O[mt][nv], [&](float & v, size_t row, size_t c) {
+                        op[(mt * 8 + row) * D + xfa_q8_vperm(s, nv, (int) c)] = v;
+                    });
+            sycl::group_barrier(it.get_group());
+            for (int r = tid; r < R8; r += NSG * SG) p.ML[(int64_t) g * R8 + r] = sycl::float2(mr[r], lr[r]);
+        });
+    });
+}
+
+
+void xfa_dispatch_q8(sycl::queue & q, const xfa_params & p) {
+    const int R8 = (p.Rw + 7) / 8, R16 = (p.Rw + 15) / 16;
+#define XFA_CASE(a, b) if (R8 == a && R16 == b) {                                                      xfa_launch_main_q8<a, b>(q, p);                                                                   if (p.nchunks <= XFA_CMAX) { xfa_launch_combine2<a * 8>(q, p); } else { xfa_launch_combine<a * 8>(q, p); }         return; }
+    XFA_CASE(1, 1) XFA_CASE(2, 1) XFA_CASE(3, 2) XFA_CASE(4, 2) XFA_CASE(5, 3) XFA_CASE(6, 3)
+#undef XFA_CASE
+    GGML_ABORT("XMX FA q8_0: unsupported rows per work-group %d", p.Rw);
+}
+
 void xfa_dispatch(sycl::queue & q, const xfa_params & p) {
     const int R8 = (p.Rw + 7) / 8, R16 = (p.Rw + 15) / 16;
 #define XFA_CASE(a, b) if (R8 == a && R16 == b) { xfa_run<a, b>(q, p); return; }
@@ -498,7 +811,8 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     // GGML_SYCL_XMX_FA_V2: split any R > 30 in two (the row -> (token, head) map is per row, so a split need not fall on
     // a token boundary): 7 tokens (42 rows) 725 -> 623 us at kv 65536; 5 tokens (30 rows) stays whole (511 vs 552)
     static const int qs_env = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_QS", 0);
-    const bool v2 = ggml_sycl_fattn_xmx_v2();
+    const bool q8 = K->type == GGML_TYPE_Q8_0;
+    const bool v2 = q8 || ggml_sycl_fattn_xmx_v2();   // the q8_0 kernel always uses the FA_V2 launch policy
     int qs = v2 ? ((R > 30 && R % 2 == 0) ? 2 : 1) : ((R > 24 && nb % 2 == 0) ? 2 : 1);
     if (qs_env > 0 && (v2 ? R % qs_env : nb % qs_env) == 0 && (R / qs_env) <= XFA_MAXR) {
         qs = qs_env;
@@ -555,7 +869,23 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     p.scale   = scale;
     p.qs      = qs;
     p.Rw      = Rw;
+    p.K8      = nullptr;
+    p.V8      = nullptr;
+    p.k8_s1 = p.k8_s2 = p.v8_s1 = p.v8_s2 = 0;
 
+    if (q8) {
+        p.K     = nullptr;
+        p.V     = nullptr;
+        p.k_s1 = p.k_s2 = p.v_s1 = p.v_s2 = 0;
+        p.K8    = (const uint8_t *) K->data;
+        p.V8    = (const uint8_t *) V->data;
+        p.k8_s1 = K->nb[1];
+        p.k8_s2 = K->nb[2];
+        p.v8_s1 = V->nb[1];
+        p.v8_s2 = V->nb[2];
+        xfa_dispatch_q8(*ctx.stream(), p);
+        return;
+    }
     xfa_dispatch(*ctx.stream(), p);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;

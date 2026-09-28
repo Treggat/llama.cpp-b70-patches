@@ -11095,6 +11095,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    // LOCAL (xmx-fa q8): the SYCL XMX FA kernel for a q8_0 KV cache (GGML_SYCL_XMX_FA_Q8=1): seat decode/verify
+    // shapes in the real KV-cache layout (K nb1 = 4*8*34 = 1088 B, nb2 = 272 B), a partial last chunk + KV-cache view
+    // (4160), and the other GQA tilings
+    for (int kv : { 4096, 32768, 65536, 81920, }) {
+        for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+        }
+    }
+    for (int nb : { 1, 3, 5, 7, 8, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true));
+    // prefill-size ubatch over a q8_0 cache (oneDNN SDPA after a q8_0 -> f16 dequant of K/V)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    // LOCAL (draftcost): the other q8_0-cache batch sizes of a q8_0 target / MTP draft KV: 9..31 tokens (TILE on the
+    // dequantized cache), a full 2048-token prefill ubatch (oneDNN), and a catch-up/verify n=1..8 at a 1-chunk KV
+    for (int nb : { 9, 12, 16, 31, 2048, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    }
+    for (int nb : { 1, 4, 8, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    }
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -11495,6 +11519,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248320, 1, 1, 1}));
+    // LOCAL (draftcost): MTP draft-token costs - trimmed draft heads (65536 / 49152 rows), the draft sampler's
+    // top-k(10) over the padded vocab vs the draft-head width, and the draft attention at full seat depth
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 65536, 1, 5120, { 1, 1 }, { 1, 1 }));
+    for (int cols : { 248320, 98304, 65536, 49152 }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 1, 1, 1}, 10));
+    }
+    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int kv : { 98304, 131072 }) {
+            for (int nb : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false));
+            }
+        }
+    }
 
     // LOCAL (not for upstream): model-shape q4_K matmuls at verify column counts (SYCL oneDNN u4 path vs MMVQ)
     // (1024x5120: small-weight check for the XMX column window, as for q6_K below)
@@ -11844,6 +11881,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 4096, 32768, 49152, 65536, 81920, 131072, }) {
         for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
+    // LOCAL (xmx-fa q8): the same shapes with a q8_0 KV cache (GGML_SYCL_XMX_FA_Q8=1; K nb1 = 1088, nb2 = 272)
+    for (int kv : { 4096, 32768, 49152, 65536, 81920, 131072, }) {
+        for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+        }
+    }
+    // LOCAL (xmx-fa q8): a 2048-token prefill ubatch at depth 32k (kv 34816), f16 vs q8_0 cache
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+    }
+    // LOCAL (xmx-fa q8): the KV-cache write of a verify step (k_cur 1024 x n into an 81920-row cache), f16 vs q8_0
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+        for (int n : { 1, 4, 8, }) {
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, t, GGML_TYPE_I64, { 1024, 81920, 1, 1 }, { 1, 1 }, n, false));
         }
     }
 

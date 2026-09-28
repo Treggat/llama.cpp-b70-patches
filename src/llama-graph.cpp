@@ -2644,6 +2644,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
+        // [draftcost] tag the attention of an MTP draft context (op_params[15], otherwise unused and ignored by every
+        // backend except SYCL's GGML_SYCL_XMX_FA_DRAFT_N1), so a backend can pick a draft-only kernel: the draft's
+        // outputs never reach the target, which verifies every token itself
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            cur->op_params[15] = 0x4D545044; // 'MTPD'
+        }
 
         if (v_mla) {
 #if 0

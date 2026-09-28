@@ -1772,6 +1772,32 @@ static void ggml_sched_stage_commit(ggml_backend_sched_t sched, int backend_id, 
     }
 }
 
+// [draftcost] GGML_SCHED_PROF=1 (LOCAL, default off): host time of the input uploads and of the backend
+// graph_compute_async call per split, for decode-size splits (all staged inputs < 1 MiB); printed at exit
+struct ggml_sched_prof_acc { int64_t n = 0, n_in = 0; double inputs_ms = 0, compute_ms = 0; };
+static ggml_sched_prof_acc g_sched_prof[2];
+static void ggml_sched_prof_print() {
+    const char * nm[2] = { "decode-size", "large" };
+    for (int i = 0; i < 2; ++i) {
+        const auto & a = g_sched_prof[i];
+        if (a.n) {
+            fprintf(stderr, "[sched-prof] %-11s splits=%8lld avg inputs=%.1f upload=%.4f ms compute_async=%.4f ms\n",
+                    nm[i], (long long) a.n, (double) a.n_in / a.n, a.inputs_ms / a.n, a.compute_ms / a.n);
+        }
+    }
+}
+static bool ggml_sched_prof_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SCHED_PROF");
+        const bool v = e && atoi(e) != 0;
+        if (v) {
+            atexit(ggml_sched_prof_print);
+        }
+        return v;
+    }();
+    return on;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1794,6 +1820,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
+
+        const bool    sp_on = ggml_sched_prof_on();
+        const int64_t sp_t0 = sp_on ? ggml_time_us() : 0;
+        size_t        sp_bytes = 0;
+        if (sp_on) {
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                sp_bytes += ggml_nbytes(split->inputs[input_id]);
             }
         }
 
@@ -1952,7 +1987,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t sp_t1 = sp_on ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sp_on) {
+                auto & a = g_sched_prof[sp_bytes < (1u << 20) ? 0 : 1];
+                a.n++;
+                a.n_in       += split->n_inputs;
+                a.inputs_ms  += (sp_t1 - sp_t0) / 1000.0;
+                a.compute_ms += (ggml_time_us() - sp_t1) / 1000.0;
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
