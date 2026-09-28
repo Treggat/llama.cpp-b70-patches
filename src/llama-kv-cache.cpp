@@ -1827,6 +1827,47 @@ static int llama_kq_mask_hint_mode() {
 // keep op_params stable for the SYCL graph cache)
 static constexpr uint32_t LLAMA_KQ_MASK_HINT_MIN_TOKENS = 32;
 
+// [prefill2] GGML_SYCL_FA_STATS=1 (default 0; the same switch as the SYCL backend's counters): per-process counters of the
+// KQ-mask hint as llama decides it. Categories: small (< 32 tokens, never tagged), tagged, and untagged by reason:
+// hint mode off, non-causal/SWA/ALiBi, multi-stream, multi-sequence ubatch, other sequences in the cache, positions
+// not strictly increasing (e.g. M-RoPE image tokens), non-empty tail, ubatch not the last cells.
+static int64_t g_kq_mask_st[12] = {};   // [0] small, [1] tagged, [2..9] untagged by reason (0..7), [10] fills skipped, [11] marked not-uploaded
+static int64_t g_kq_mask_st_last[3] = {};
+static void llama_kq_mask_stats_print() {
+    const int64_t * s = g_kq_mask_st;
+    fprintf(stderr, "[kq-mask-stats] masks=%lld small=%lld tagged=%lld marked_no_upload=%lld fill_skipped=%lld | untagged: "
+            "hint_off=%lld noncausal_swa_alibi=%lld multistream=%lld multiseq=%lld other_seqs=%lld pos_not_increasing=%lld "
+            "tail_not_empty=%lld not_last_cells=%lld | last n_kv=%lld n_used=%lld n_tokens=%lld\n",
+            (long long) (s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7] + s[8] + s[9]), (long long) s[0],
+            (long long) s[1], (long long) s[11], (long long) s[10], (long long) s[2], (long long) s[3], (long long) s[4],
+            (long long) s[5], (long long) s[6], (long long) s[7], (long long) s[8], (long long) s[9],
+            (long long) g_kq_mask_st_last[0], (long long) g_kq_mask_st_last[1], (long long) g_kq_mask_st_last[2]);
+    fflush(stderr);
+}
+static bool llama_kq_mask_stats_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SYCL_FA_STATS");
+        const bool v = e && atoi(e) > 0;
+        if (v) {
+            atexit(llama_kq_mask_stats_print);
+        }
+        return v;
+    }();
+    return on;
+}
+// cat: -1 small, 0 tagged, 1 + reason untagged
+static void llama_kq_mask_stats_add(int cat, bool filled, bool no_upload, int64_t n_kv, int64_t n_used, int64_t n_tokens) {
+    g_kq_mask_st[cat < 0 ? 0 : cat + 1]++;
+    if (!filled) g_kq_mask_st[10]++;
+    if (no_upload) g_kq_mask_st[11]++;
+    g_kq_mask_st_last[0] = n_kv; g_kq_mask_st_last[1] = n_used; g_kq_mask_st_last[2] = n_tokens;
+    int64_t n = 0;
+    for (int i = 0; i < 10; ++i) n += g_kq_mask_st[i];
+    if (n >= 8 && (n & (n - 1)) == 0) {
+        llama_kq_mask_stats_print();
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1871,6 +1912,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // [prefillx] structure hint (from the cell positions, before the fill)
     bool    hinted = false;
     int64_t n_used = 0;
+    int     why    = 0;   // [prefill2] GGML_SYCL_FA_STATS: why a >= 32-token mask was not tagged (see llama_kq_mask_stats)
+    if (llama_kq_mask_hint_mode() > 0 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
+        why = !(causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi) ? 1 : n_stream != 1 ? 2 : 0;
+    }
     if (llama_kq_mask_hint_mode() > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
         n_stream == 1 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
         const llama_seq_id s0 = ubatch->seq_id[0][0];
@@ -1878,23 +1923,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         for (uint32_t i = 0; i < n_tokens && ok; ++i) {
             ok = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s0;
         }
+        if (!ok) why = 3;
         const auto & cells = v_cells.at(seq_to_stream[s0]);
         ok = ok && cells.get_used() == cells.seq_n_cells(s0) && (int64_t) cells.size() >= n_kv;
+        if (!ok && !why) why = 4;
         if (ok) {
             const llama_pos * P = cells.pos_data();
             while (n_used < n_kv && P[n_used] >= 0) {
                 if (n_used > 0 && P[n_used] <= P[n_used - 1]) {
                     ok = false;
+                    why = 5;
                     break;
                 }
                 n_used++;
             }
             for (int64_t j = n_used; ok && j < n_kv; ++j) {
                 ok = P[j] < 0;
+                if (!ok) why = 6;
             }
-            ok = ok && n_used >= (int64_t) n_tokens;
+            if (ok && n_used < (int64_t) n_tokens) { ok = false; why = 7; }
             for (uint32_t i = 0; ok && i < n_tokens; ++i) {
                 ok = P[n_used - n_tokens + i] == ubatch->pos[i];
+                if (!ok) why = 7;
             }
         }
         if (ok) {
@@ -1915,6 +1965,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         return e && atoi(e) != 0;
     }();
     const bool filled = !(nofill && hinted && dst->op_params[3] == 1);
+
+    // [prefill2] GGML_SYCL_FA_STATS: tag counters, printed to stderr (not the llama log) at exit and at powers of two
+    if (llama_kq_mask_stats_on()) {
+        llama_kq_mask_stats_add(n_tokens < LLAMA_KQ_MASK_HINT_MIN_TOKENS ? -1 : hinted ? 0 : why + 1, filled,
+                                hinted && dst->op_params[3] == 1, n_kv, n_used, n_tokens);
+    }
 
     if (filled) {
         if (dst->type == GGML_TYPE_F16) {
@@ -2237,15 +2293,35 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+// [prefill2] env LLAMA_KV_CKPT_PARTIAL_SKIP=1 (default 0): a PARTIAL_ONLY state of a plain (non-SWA) KV cache - the MTP
+// draft context's part of every server context checkpoint - holds no cells. The cache can drop any suffix with seq_rm,
+// which the server does right after restoring a checkpoint, and the cells below the checkpoint position are the ones the
+// checkpoint copied (they are never rewritten while the checkpoint is valid), so the full copy (tens of MiB D2H per
+// checkpoint, H2D per restore) is not needed. SWA caches keep the full copy (their partial state is the SWA window).
+static bool llama_kv_ckpt_partial_skip() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_KV_CKPT_PARTIAL_SKIP");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
 
-    GGML_UNUSED(flags);
-
     io.write(&n_stream, sizeof(n_stream));
+
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && seq_id >= 0 && swa_type == LLAMA_SWA_TYPE_NONE &&
+        llama_kv_ckpt_partial_skip()) {
+        const uint32_t cell_count = 0;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            io.write(&cell_count, sizeof(cell_count));
+        }
+        return;
+    }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         cell_ranges_t cr { s, {} };

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -115,9 +116,64 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
 #endif
 }
 
+// ---- LOCAL (prefill2) GGML_SYCL_FA_STATS ----
+static int64_t g_fa_stats[FA_ST_COUNT] = {};
+static double  g_fa_stats_maxdiff = 0.0;
+
+static void ggml_sycl_fa_stats_print() {
+    const int64_t * s = g_fa_stats;
+    fprintf(stderr,
+            "[fa-stats] calls=%lld kernel: onednn=%lld xmx=%lld tile=%lld vec=%lld mkl=%lld | mask: none=%lld untagged=%lld "
+            "tagged=%lld not_uploaded=%lld | onednn: causal=%lld explicit_tagged=%lld explicit_untagged=%lld "
+            "causal_nofuse=%lld fallback_tile=%lld fallback_exc=%lld regen=%lld",
+            (long long) s[FA_ST_CALLS], (long long) s[FA_ST_K_ONEDNN], (long long) s[FA_ST_K_XMX],
+            (long long) s[FA_ST_K_TILE], (long long) s[FA_ST_K_VEC], (long long) s[FA_ST_K_MKL],
+            (long long) s[FA_ST_MASK_NONE], (long long) s[FA_ST_MASK_UNTAGGED], (long long) s[FA_ST_MASK_TAGGED],
+            (long long) s[FA_ST_MASK_NOTUPLOADED], (long long) s[FA_ST_CAUSAL], (long long) s[FA_ST_EXPL_TAGGED],
+            (long long) s[FA_ST_EXPL_UNTAGGED], (long long) s[FA_ST_CAUSAL_NOFUSE], (long long) s[FA_ST_FALLBACK_TILE],
+            (long long) s[FA_ST_FALLBACK_EXC], (long long) s[FA_ST_REGEN]);
+    if (s[FA_ST_CMP_CALLS] > 0) {
+        fprintf(stderr, " | compare: calls=%lld calls_differing=%lld values_differing=%lld/%lld max_abs_diff=%.6g",
+                (long long) s[FA_ST_CMP_CALLS], (long long) s[FA_ST_CMP_DIFF_CALLS],
+                (long long) s[FA_ST_CMP_DIFF_VALUES], (long long) s[FA_ST_CMP_VALUES], g_fa_stats_maxdiff);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+int ggml_sycl_fa_stats_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_SYCL_FA_STATS");
+        const int m = e ? atoi(e) : 0;
+        if (m > 0) {
+            atexit(ggml_sycl_fa_stats_print);
+        }
+        return m;
+    }();
+    return mode;
+}
+
+void ggml_sycl_fa_stat(ggml_sycl_fa_stat_id id, int64_t n) {
+    g_fa_stats[id] += n;
+}
+
+void ggml_sycl_fa_stat_maxdiff(double d) {
+    g_fa_stats_maxdiff = std::max(g_fa_stats_maxdiff, d);
+}
+
+void ggml_sycl_fa_stats_tick() {
+    const int64_t n = g_fa_stats[FA_ST_CALLS];
+    if (n >= 16 && (n & (n - 1)) == 0) {
+        ggml_sycl_fa_stats_print();
+    }
+}
+
 void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask_c) {
     if (!mask_c || mask_c->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL || mask_c->op_params[3] != 1) {
         return;
+    }
+    if (ggml_sycl_fa_stats_mode() > 0) {
+        ggml_sycl_fa_stat(FA_ST_REGEN);
     }
     // test hook (negative control of the GGML_SYCL_FA_MASK_POISON test): PX_NO_ENSURE=1 skips the rebuild
     static const bool no_ensure = getenv("PX_NO_ENSURE") != nullptr;
@@ -527,11 +583,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // pointers and strides stay those of the n_kv-cell tensors; only the sequence dimension shrinks), else the
     // explicit-mask partition over all n_kv cells
     const int64_t n_used = ggml_sycl_fa_causal_n_used(mask, q, seq);
+    const int     st_mode = ggml_sycl_fa_stats_mode();
+    const bool    tagged  = mask && mask->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL;
     sdpa_partition * Ep = nullptr;
     if (n_used > 0) {
         sdpa_partition & Ec = get_partition(n_used, true);
         if (Ec.ok) {
             Ep = &Ec;
+        } else if (st_mode > 0) {
+            ggml_sycl_fa_stat(FA_ST_CAUSAL_NOFUSE);
         }
     }
     if (Ep == nullptr) {
@@ -541,37 +601,81 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     sdpa_partition & E = *Ep;
     if (!E.ok) {
         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
+        if (st_mode > 0) {
+            ggml_sycl_fa_stat(FA_ST_FALLBACK_TILE);
+        }
+        ggml_sycl_fa_mask_ensure(ctx, mask);
         ggml_sycl_flash_attn_ext_tile(ctx, dst);
         return;
     }
+    if (st_mode > 0) {
+        ggml_sycl_fa_stat(E.id_kvlen != SIZE_MAX ? FA_ST_CAUSAL : tagged ? FA_ST_EXPL_TAGGED : FA_ST_EXPL_UNTAGGED);
+    }
 
-    auto id2ptr = [&](size_t r) -> void * {
-        if (r == E.id_q)     return Qf_ptr;
-        if (r == E.id_k)     return K_ptr;
-        if (r == E.id_v)     return V_ptr;
-        if (r == E.id_scale) return scale_dev;
-        if (r == E.id_mask)  return (void *) mask->data;
-        return nullptr;
+    auto run_partition = [&](sdpa_partition & P, sycl::half * out_ptr) {
+        auto id2ptr = [&](size_t r) -> void * {
+            if (r == P.id_q)     return Qf_ptr;
+            if (r == P.id_k)     return K_ptr;
+            if (r == P.id_v)     return V_ptr;
+            if (r == P.id_scale) return scale_dev;
+            if (r == P.id_mask)  return (void *) mask->data;
+            return nullptr;
+        };
+        std::vector<tensor> ti;
+        ti.reserve(P.ins.size());
+        int32_t kvlen_v = (int32_t) n_used;
+        int32_t qlen_v  = (int32_t) q;
+        float   ninf_v  = -INFINITY;
+        for (auto & lt : P.ins) {
+            const size_t lid = lt.get_id();
+            if (lid == P.id_kvlen) {
+                ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
+            } else if (lid == P.id_qlen) {
+                ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
+            } else if (lid == P.id_ninf) {
+                ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
+            } else {
+                ti.emplace_back(lt, eng, id2ptr(lid));
+            }
+        }
+        tensor to(P.out, eng, out_ptr);
+        P.cp.execute(strm, ti, {to});
     };
-    std::vector<tensor> ti;
-    ti.reserve(E.ins.size());
-    int32_t kvlen_v = (int32_t) n_used;
-    int32_t qlen_v  = (int32_t) q;
-    float   ninf_v  = -INFINITY;
-    for (auto & lt : E.ins) {
-        const size_t lid = lt.get_id();
-        if (lid == E.id_kvlen) {
-            ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
-        } else if (lid == E.id_qlen) {
-            ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
-        } else if (lid == E.id_ninf) {
-            ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
-        } else {
-            ti.emplace_back(lt, eng, id2ptr(lid));
+    run_partition(E, outf_ptr);
+
+    // LOCAL (prefill2) GGML_SYCL_FA_STATS=2: rerun the explicit-mask partition over all n_kv cells and compare the f16
+    // SDPA outputs bit for bit (test mode; host-synchronous, never while a SYCL graph is being recorded)
+    if (st_mode >= 2 && E.id_kvlen != SIZE_MAX && !g_ggml_sycl_graph_recording) {
+        ggml_sycl_fa_mask_ensure(ctx, mask);
+        sdpa_partition & X = get_partition(seq, false);
+        if (X.ok) {
+            const size_t nv = (size_t) H * q * d;
+            ggml_sycl_pool_alloc<sycl::half> ref(ctx.pool(), nv);
+            run_partition(X, ref.get());
+            std::vector<sycl::half> a(nv), b(nv);
+            stream->memcpy(a.data(), outf_ptr, nv * sizeof(sycl::half));
+            stream->memcpy(b.data(), ref.get(), nv * sizeof(sycl::half));
+            stream->wait_and_throw();
+            int64_t ndiff = 0;
+            double  maxd  = 0.0;
+            for (size_t i = 0; i < nv; ++i) {
+                uint16_t ua, ub;
+                memcpy(&ua, &a[i], 2);
+                memcpy(&ub, &b[i], 2);
+                if (ua != ub) {
+                    ndiff++;
+                    maxd = std::max(maxd, (double) std::fabs((float) a[i] - (float) b[i]));
+                }
+            }
+            ggml_sycl_fa_stat(FA_ST_CMP_CALLS);
+            ggml_sycl_fa_stat(FA_ST_CMP_VALUES, (int64_t) nv);
+            if (ndiff) {
+                ggml_sycl_fa_stat(FA_ST_CMP_DIFF_CALLS);
+                ggml_sycl_fa_stat(FA_ST_CMP_DIFF_VALUES, ndiff);
+                ggml_sycl_fa_stat_maxdiff(maxd);
+            }
         }
     }
-    tensor to(E.out, eng, outf_ptr);
-    E.cp.execute(strm, ti, {to});
 
     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
@@ -591,6 +695,9 @@ catch (const std::exception & e) {
     }
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
     GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
+    if (ggml_sycl_fa_stats_mode() > 0) {
+        ggml_sycl_fa_stat(FA_ST_FALLBACK_EXC);
+    }
     ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
     ggml_sycl_flash_attn_ext_tile(ctx, dst);
 }

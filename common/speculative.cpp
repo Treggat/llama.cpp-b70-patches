@@ -1425,6 +1425,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // round (only the rows below pos0, i.e. the accepted ones), or flushed at the next process() call.
     // Saves one draft-context graph (build + submit + launch overhead) per speculative step.
     bool defer_catchup = false;
+
+    // [prefill2] LLAMA_MTP_H_DEVICE=1 (default 0): prompt batches (> 16 tokens, one sequence) hand the target's h rows
+    // to the draft on the device (llama_mtp_h_dev_*, llama-ext.h) instead of D2H + 3 host copies + H2D per ubatch
+    bool h_dev = false;
     struct deferred_rows_t {
         std::vector<llama_token> tok;
         std::vector<llama_pos>   pos;
@@ -1549,6 +1553,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             defer_catchup = e && atoi(e) != 0 && !is_mem_shared && !chain_heads;
             deferred.assign(n_seq, {});
             SPC_TRC("- defer_catchup=%d\n", (int) defer_catchup);
+        }
+        {
+            const char * e = getenv("LLAMA_MTP_H_DEVICE");
+            if (e && atoi(e) != 0 && !is_mem_shared && !chain_heads && !defer_catchup &&
+                llama_n_batch(ctx_dft) <= llama_n_batch(ctx_tgt)) {
+                h_dev = llama_mtp_h_dev_link(ctx_tgt, ctx_dft);
+            }
+            SPC_TRC("- h_dev=%d\n", (int) h_dev);
         }
     }
 
@@ -1682,6 +1694,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         const int64_t hp_prep_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [hostv] mtp.catchup_prep
+        // [prefill2] LLAMA_MTP_H_DEVICE: the h rows of this batch are on the device (same test as the target's decode)
+        const bool use_h_dev = h_dev && !is_mem_shared && llama_mtp_h_dev_batch_ok(ctx_tgt, &batch_in);
+        const llama_seq_id h_dev_seq = use_h_dev ? batch_in.seq_id[0][0] : -1;
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
@@ -1694,7 +1709,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            {
+            if (!use_h_dev) {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
@@ -1704,7 +1719,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && !use_h_dev; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
@@ -1742,7 +1757,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_hprof_record("mtp.catchup_prep", hp_prep_t0);
                 }
                 const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                int32_t rc;
+                if (use_h_dev) {
+                    // device row 0 = the pending row, rows 1.. = the target's h rows of this batch
+                    llama_mtp_h_dev_begin(ctx_dft, pending_h[h_dev_seq].data());
+                    llama_batch b = batch;
+                    b.embd = nullptr;
+                    rc = llama_decode(ctx_dft, b);
+                    llama_mtp_h_dev_end(ctx_dft);
+                } else {
+                    rc = llama_decode(ctx_dft, batch);
+                }
                 if (hp_t0) {
                     llama_hprof_record(batch.n_tokens <= 16 ? "mtp.catchup_decode_call" : "mtp.catchup_decode_call.pp", hp_t0);
                 }
@@ -1767,6 +1792,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
+                continue;
+            }
+
+            if (use_h_dev) {
+                // only the last row is on the host (the carry-over for the next batch); a prompt batch is never
+                // followed by accept(), which reads verify rows of verification batches only
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
+                verify_h_rows[seq_id] = 1;
+                verify_h[seq_id].assign(h, h + n_embd);
+                std::memcpy(pending_h[seq_id].data(), h, row_bytes);
                 continue;
             }
 

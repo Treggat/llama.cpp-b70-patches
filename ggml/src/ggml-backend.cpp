@@ -1798,6 +1798,35 @@ static bool ggml_sched_prof_on() {
     return on;
 }
 
+// [prefill2] GGML_SYCL_FA_STATS=1 (LOCAL, default 0): hinted KQ-mask inputs whose upload the scheduler skipped / still
+// uploaded, printed to stderr at exit and at powers of two
+static int64_t g_sched_mask_st[2] = {}, g_sched_mask_bytes[2] = {};
+static void ggml_sched_mask_stats_print() {
+    fprintf(stderr, "[sched-mask-stats] hinted mask inputs: upload_skipped=%lld (%.1f MB) uploaded=%lld (%.1f MB)\n",
+            (long long) g_sched_mask_st[0], g_sched_mask_bytes[0] / 1e6, (long long) g_sched_mask_st[1],
+            g_sched_mask_bytes[1] / 1e6);
+    fflush(stderr);
+}
+static void ggml_sched_mask_stats_add(int i, size_t bytes) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SYCL_FA_STATS");
+        const bool v = e && atoi(e) > 0;
+        if (v) {
+            atexit(ggml_sched_mask_stats_print);
+        }
+        return v;
+    }();
+    if (!on) {
+        return;
+    }
+    g_sched_mask_st[i]++;
+    g_sched_mask_bytes[i] += (int64_t) bytes;
+    const int64_t n = g_sched_mask_st[0] + g_sched_mask_st[1];
+    if (n >= 8 && (n & (n - 1)) == 0) {
+        ggml_sched_mask_stats_print();
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1862,7 +1891,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && input->op_params[3] == 1 &&
                     input->type == GGML_TYPE_F16 &&
                     ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ggml_sched_mask_stats_add(0, ggml_nbytes(input));
                     continue;
+                }
+                if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL) {
+                    ggml_sched_mask_stats_add(1, ggml_nbytes(input));
                 }
             }
 

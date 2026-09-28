@@ -326,6 +326,23 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
     // LOCAL (prefillx): a hinted mask that was not uploaded is rebuilt on the device for every kernel that reads it
     // (the oneDNN path decides for itself: its implicit-causal partition does not read the mask)
+    // LOCAL (prefill2) GGML_SYCL_FA_STATS: dispatch + mask-hint counters
+    const bool fa_st = ggml_sycl_fa_stats_mode() > 0;
+    if (fa_st) {
+        const ggml_tensor * m = dst->src[3];
+        ggml_sycl_fa_stat(FA_ST_CALLS);
+        ggml_sycl_fa_stat(fk == BEST_FATTN_KERNEL_ONEDNN ? FA_ST_K_ONEDNN : fk == BEST_FATTN_KERNEL_XMX ? FA_ST_K_XMX :
+                          fk == BEST_FATTN_KERNEL_VEC ? FA_ST_K_VEC : fk == BEST_FATTN_KERNEL_MKL ? FA_ST_K_MKL : FA_ST_K_TILE);
+        if (!m) {
+            ggml_sycl_fa_stat(FA_ST_MASK_NONE);
+        } else if (m->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL) {
+            ggml_sycl_fa_stat(FA_ST_MASK_UNTAGGED);
+        } else if (m->op_params[3] == 1 || m->op_params[3] == 2) {
+            ggml_sycl_fa_stat(FA_ST_MASK_NOTUPLOADED);
+        } else {
+            ggml_sycl_fa_stat(FA_ST_MASK_TAGGED);
+        }
+    }
     if (fk != BEST_FATTN_KERNEL_ONEDNN) {
         ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
     }
@@ -351,6 +368,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_XMX:
             ggml_sycl_fattn_xmx(ctx, dst);
             break;
+    }
+    if (fa_st) {
+        ggml_sycl_fa_stats_tick();
     }
 
     // --- Output fingerprint (GGML_SYCL_MKL_FA_DIAG=1) ---

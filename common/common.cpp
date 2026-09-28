@@ -3,6 +3,8 @@
 
 #include "build-info.h"
 #include "common.h"
+
+#include <mutex>
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2251,6 +2253,113 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// ---- [prefill2] LLAMA_CKPT_POOL: reuse of checkpoint state buffers (see common.h) ----
+static bool common_ckpt_pool_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_CKPT_POOL");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// never destroyed: checkpoints may still be released during static destruction at exit
+static std::mutex &                        g_ckpt_pool_mtx   = *new std::mutex();
+static std::vector<std::vector<uint8_t>> & g_ckpt_pool       = *new std::vector<std::vector<uint8_t>>();
+static size_t                              g_ckpt_pool_bytes = 0;
+static constexpr size_t COMMON_CKPT_POOL_MAX_BUFS  = 12;
+static constexpr size_t COMMON_CKPT_POOL_MAX_BYTES = 2ull << 30;
+static constexpr size_t COMMON_CKPT_POOL_MIN_BYTES = 1ull << 20;
+
+// hand a buffer that is no longer needed to the pool (dropped when the pool is full)
+static void common_ckpt_pool_give(std::vector<uint8_t> & v) {
+    if (!common_ckpt_pool_on() || v.capacity() < COMMON_CKPT_POOL_MIN_BYTES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_ckpt_pool_mtx);
+    if (g_ckpt_pool.size() >= COMMON_CKPT_POOL_MAX_BUFS || g_ckpt_pool_bytes + v.capacity() > COMMON_CKPT_POOL_MAX_BYTES) {
+        return;
+    }
+    g_ckpt_pool_bytes += v.capacity();
+    g_ckpt_pool.emplace_back();
+    g_ckpt_pool.back().swap(v);
+}
+
+// size v to n bytes, reusing a pooled buffer of the same size when v has no room (contents are overwritten by the caller)
+static void common_ckpt_pool_resize(std::vector<uint8_t> & v, size_t n) {
+    if (common_ckpt_pool_on() && v.capacity() < n && n >= COMMON_CKPT_POOL_MIN_BYTES) {
+        std::lock_guard<std::mutex> lk(g_ckpt_pool_mtx);
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < g_ckpt_pool.size(); ++i) {
+            // an exactly sized buffer (the recurrent state has one fixed size), else the smallest that holds n and has
+            // n bytes already constructed (no zero fill of a tail)
+            if (g_ckpt_pool[i].size() >= n && (best == SIZE_MAX || g_ckpt_pool[i].size() < g_ckpt_pool[best].size())) {
+                best = i;
+            }
+        }
+        if (best != SIZE_MAX && g_ckpt_pool[best].size() <= 2 * n) {
+            std::vector<uint8_t> old;
+            old.swap(v);
+            v.swap(g_ckpt_pool[best]);
+            g_ckpt_pool_bytes -= v.capacity();
+            g_ckpt_pool.erase(g_ckpt_pool.begin() + best);
+            // the replaced (smaller) buffer is simply freed
+        }
+    }
+    v.resize(n);
+}
+
+common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other)
+    : n_tokens(other.n_tokens), id_task(other.id_task), pos_min(other.pos_min), pos_max(other.pos_max),
+      data_spec(other.data_spec) {
+    common_ckpt_pool_resize(data_tgt, other.data_tgt.size());
+    if (!other.data_tgt.empty()) {
+        memcpy(data_tgt.data(), other.data_tgt.data(), other.data_tgt.size());
+    }
+    common_ckpt_pool_resize(data_dft, other.data_dft.size());
+    if (!other.data_dft.empty()) {
+        memcpy(data_dft.data(), other.data_dft.data(), other.data_dft.size());
+    }
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & other) {
+    if (this != &other) {
+        n_tokens  = other.n_tokens;
+        id_task   = other.id_task;
+        pos_min   = other.pos_min;
+        pos_max   = other.pos_max;
+        data_spec = other.data_spec;
+        common_ckpt_pool_resize(data_tgt, other.data_tgt.size());
+        if (!other.data_tgt.empty()) {
+            memcpy(data_tgt.data(), other.data_tgt.data(), other.data_tgt.size());
+        }
+        common_ckpt_pool_resize(data_dft, other.data_dft.size());
+        if (!other.data_dft.empty()) {
+            memcpy(data_dft.data(), other.data_dft.data(), other.data_dft.size());
+        }
+    }
+    return *this;
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && other) noexcept {
+    if (this != &other) {
+        common_ckpt_pool_give(data_tgt);
+        common_ckpt_pool_give(data_dft);
+        n_tokens  = other.n_tokens;
+        id_task   = other.id_task;
+        pos_min   = other.pos_min;
+        pos_max   = other.pos_max;
+        data_tgt  = std::move(other.data_tgt);
+        data_dft  = std::move(other.data_dft);
+        data_spec = std::move(other.data_spec);
+    }
+    return *this;
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    common_ckpt_pool_give(data_tgt);
+    common_ckpt_pool_give(data_dft);
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2287,11 +2396,23 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    // [prefill2] LLAMA_HOST_PROF: sync / size / alloc / copy split of a checkpoint
+    const bool hp = llama_hprof_enabled();
+    int64_t t0 = hp ? ggml_time_us() : 0;
+    if (hp) {
+        llama_synchronize(ctx);
+        llama_hprof_record("ckpt.tgt.sync", t0);
+        t0 = ggml_time_us();
+    }
 
-    data_tgt.resize(ckpt_size);
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    if (hp) { llama_hprof_record("ckpt.tgt.size", t0); t0 = ggml_time_us(); }
+
+    common_ckpt_pool_resize(data_tgt, ckpt_size);
+    if (hp) { llama_hprof_record("ckpt.tgt.resize", t0); t0 = ggml_time_us(); }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    if (hp) { llama_hprof_record("ckpt.tgt.get_data", t0); }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2307,7 +2428,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    common_ckpt_pool_resize(data_dft, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

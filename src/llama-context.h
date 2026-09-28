@@ -117,6 +117,12 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // [prefill2] LLAMA_MTP_H_DEVICE (see llama-ext.h)
+    bool mtp_h_dev_link(llama_context * ctx_dft);
+    bool mtp_h_dev_batch_ok(const llama_batch & batch) const;
+    void mtp_h_dev_begin(const float * pending_row);
+    void mtp_h_dev_end();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -403,6 +409,11 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // [prefill2] LLAMA_MTP_H_DEVICE: the device tensor for the MTP hidden states (owned by the target context)
+    ggml_context_ptr        mtp_h_ctx;
+    ggml_backend_buffer_ptr mtp_h_buf;
+    bool                    mtp_h_dev_active = false; // draft: the next decode reads h from cparams.mtp_h_dev
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

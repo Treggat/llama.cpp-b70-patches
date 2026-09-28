@@ -1310,6 +1310,70 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+// [prefill2] LLAMA_MTP_H_DEVICE: keep the MTP hidden states on the device during prompt processing. The target's graph
+// copies its h_nextn rows into a device tensor (rows 1 + i), the draft's MTP graph reads its h input from the same tensor
+// (row 0 = the pending row carried over from the previous batch, uploaded by mtp_h_dev_begin). Replaces, for batches
+// accepted by mtp_h_dev_batch_ok: the h_nextn D2H of every row, the host shift copy into the draft batch, the batch
+// allocator's copy, the draft input copy and its H2D upload. Same values: rows are moved, never recomputed.
+bool llama_context::mtp_h_dev_link(llama_context * dft) {
+    if (dft == nullptr || dft == this || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (auto & b : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            buft = ggml_backend_get_default_buffer_type(b.get());
+            break;
+        }
+    }
+    if (buft == nullptr) {
+        return false;
+    }
+    const int64_t n_embd = model.hparams.n_embd_out();
+    const int64_t n_rows = (int64_t) cparams.n_batch + 1;
+    ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+    mtp_h_ctx.reset(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(mtp_h_ctx.get(), GGML_TYPE_F32, n_embd, n_rows);
+    ggml_set_name(t, "mtp_h_dev");
+    mtp_h_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_h_ctx.get(), buft));
+    if (!mtp_h_buf) {
+        mtp_h_ctx.reset();
+        return false;
+    }
+    cparams.mtp_h_dev           = t;
+    cparams.mtp_h_dev_role      = 1;
+    dft->cparams.mtp_h_dev      = t;
+    dft->cparams.mtp_h_dev_role = 2;
+    LLAMA_LOG_INFO("%s: MTP hidden states kept on the device (%lld x %lld f32, %.1f MiB in %s)\n", __func__,
+            (long long) n_embd, (long long) n_rows, ggml_nbytes(t) / 1048576.0, ggml_backend_buft_name(buft));
+    return true;
+}
+
+bool llama_context::mtp_h_dev_batch_ok(const llama_batch & batch) const {
+    if (cparams.mtp_h_dev_role != 1 || cparams.mtp_h_dev == nullptr || !cparams.embeddings_nextn ||
+        cparams.embeddings_nextn_masked || batch.token == nullptr || batch.embd != nullptr ||
+        batch.n_tokens <= 16 || batch.n_tokens > (int32_t) cparams.n_batch) {
+        return false;
+    }
+    const llama_seq_id s0 = batch.seq_id ? batch.seq_id[0][0] : 0;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if ((batch.n_seq_id && batch.n_seq_id[i] != 1) || (batch.seq_id && batch.seq_id[i][0] != s0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_context::mtp_h_dev_begin(const float * pending_row) {
+    GGML_ASSERT(cparams.mtp_h_dev_role == 2 && cparams.mtp_h_dev != nullptr);
+    ggml_backend_tensor_set(cparams.mtp_h_dev, pending_row, 0, cparams.mtp_h_dev->nb[1]);
+    mtp_h_dev_active = true;
+}
+
+void llama_context::mtp_h_dev_end() {
+    mtp_h_dev_active = false;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1464,7 +1528,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     bool hp_reused = false;
 
     // [hostv] LLAMA_GRAPH_REUSE_MULTI: small ubatches use the multi-graph cache instead of gf_res_prev
-    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel;
+    // [prefill2] a graph that reads / writes the MTP device rows depends on the ubatch's row offset: never reused
+    const bool h_dev_graph = cparams.mtp_h_dev_row0 >= 0;
+    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel && !h_dev_graph;
     graph_cache_entry * gce = nullptr;
     bool gce_hit     = false;
     bool hp_restored = false;
@@ -1518,7 +1584,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (use_gcache ? gce_hit : (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams))) {
+    if (use_gcache ? gce_hit : (!graph_reuse_disable && !h_dev_graph && gf_res_prev_active == res && res->can_reuse(gparams))) {
         hp_reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1555,13 +1621,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // [prefill2] LLAMA_MTP_H_DEVICE, target: copy this ubatch's h_nextn rows to the device rows 1 + row0 ..
+        if (h_dev_graph && cparams.mtp_h_dev_role == 1) {
+            ggml_tensor * h = res->get_h_nextn();
+            GGML_ASSERT(h != nullptr && h->type == GGML_TYPE_F32 && h->ne[1] == (int64_t) ubatch.n_tokens &&
+                        h->ne[0] == cparams.mtp_h_dev->ne[0]);
+            GGML_ASSERT(1 + cparams.mtp_h_dev_row0 + (int64_t) ubatch.n_tokens <= cparams.mtp_h_dev->ne[1]);
+            ggml_tensor * dst = ggml_view_2d(res->get_ctx(), cparams.mtp_h_dev, h->ne[0], h->ne[1],
+                    cparams.mtp_h_dev->nb[1], (size_t) (1 + cparams.mtp_h_dev_row0) * cparams.mtp_h_dev->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(res->get_ctx(), h, dst));
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_active = h_dev_graph ? nullptr : res;
 
         if (gce) {
             gce->snap = graph_cacheable(gf) ? ggml_backend_sched_snapshot_new(sched.get()) : nullptr;
@@ -2014,8 +2091,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // [prefill2] LLAMA_MTP_H_DEVICE: this batch's h rows go through the device tensor (target: accepted batch; draft:
+    // between mtp_h_dev_begin/end)
+    const bool h_dev_on = (cparams.mtp_h_dev_role == 1 && mtp_h_dev_batch_ok(batch_inp)) ||
+                          (cparams.mtp_h_dev_role == 2 && mtp_h_dev_active);
+    struct h_dev_reset_t { llama_cparams & c; ~h_dev_reset_t() { c.mtp_h_dev_row0 = -1; } } h_dev_reset { cparams };
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        cparams.mtp_h_dev_row0 = h_dev_on ? (int32_t) n_tokens_prev : -1;
 
         // count the outputs in this ubatch
         {
@@ -2186,7 +2271,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (h_dev_on && !masked) {
+                    // [prefill2] LLAMA_MTP_H_DEVICE: the rows stay on the device; the host only needs the last one
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + (n_rows - 1)*n_embd,
+                            (n_rows - 1)*n_embd*sizeof(float), n_embd*sizeof(float));
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -4176,6 +4267,22 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_mtp_h_dev_link(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    return ctx_tgt->mtp_h_dev_link(ctx_dft);
+}
+
+bool llama_mtp_h_dev_batch_ok(const llama_context * ctx_tgt, const llama_batch * batch) {
+    return ctx_tgt->mtp_h_dev_batch_ok(*batch);
+}
+
+void llama_mtp_h_dev_begin(llama_context * ctx_dft, const float * pending_row) {
+    ctx_dft->mtp_h_dev_begin(pending_row);
+}
+
+void llama_mtp_h_dev_end(llama_context * ctx_dft) {
+    ctx_dft->mtp_h_dev_end();
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

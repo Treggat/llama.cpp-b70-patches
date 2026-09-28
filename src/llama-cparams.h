@@ -21,6 +21,15 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // [prefill2] LLAMA_MTP_H_DEVICE: MTP hidden states kept on the device (see llama_mtp_h_dev_link, llama-ext.h).
+    // mtp_h_dev: [n_embd, n_batch + 1] f32 device tensor shared by the target and the draft context;
+    // mtp_h_dev_role: 1 = target (its graph writes h_nextn rows to mtp_h_dev rows 1 + row0 ..), 2 = draft (its MTP
+    // graph reads the h input from mtp_h_dev rows row0 .. instead of the ubatch embd); mtp_h_dev_row0: row offset of
+    // the current ubatch within the batch, -1 = not active for this ubatch
+    struct ggml_tensor * mtp_h_dev      = nullptr;
+    int32_t              mtp_h_dev_role = 0;
+    int32_t              mtp_h_dev_row0 = -1;
+
     float rope_freq_base;
     float rope_freq_scale;
 

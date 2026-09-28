@@ -534,6 +534,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_set_name(inp->h, "mtp_h_input");
 
     ggml_tensor * h_embd = inp->h;
+    // [prefill2] LLAMA_MTP_H_DEVICE: this ubatch's h rows are already on the device (written by the target's graph)
+    if (cparams.mtp_h_dev != nullptr && cparams.mtp_h_dev_role == 2 && cparams.mtp_h_dev_row0 >= 0) {
+        GGML_ASSERT(cparams.mtp_h_dev->ne[0] == hparams.n_embd);
+        GGML_ASSERT(cparams.mtp_h_dev_row0 + n_tokens <= cparams.mtp_h_dev->ne[1]);
+        h_embd = ggml_view_2d(ctx0, cparams.mtp_h_dev, hparams.n_embd, n_tokens, cparams.mtp_h_dev->nb[1],
+                (size_t) cparams.mtp_h_dev_row0 * cparams.mtp_h_dev->nb[1]);
+    }
 
     res->add_input(std::move(inp));
 

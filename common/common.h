@@ -1165,6 +1165,17 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 struct common_prompt_checkpoint {
+    // [prefill2] env LLAMA_CKPT_POOL=1 (default 0): the state buffers of destroyed / overwritten checkpoints are kept in a
+    // small pool (at most 12 buffers, 2 GiB) and reused by new checkpoints and by copies of checkpoints. A fresh 150 MiB
+    // std::vector costs ~100 ms in the server (page faults + zero fill) against ~10 ms to overwrite a reused one; the
+    // recurrent-state part of every checkpoint has the same size. Contents are always fully overwritten: same bytes.
+    common_prompt_checkpoint() = default;
+    common_prompt_checkpoint(const common_prompt_checkpoint & other);
+    common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept = default;
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & other);
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && other) noexcept;
+    ~common_prompt_checkpoint();
+
     int64_t n_tokens;
 
     // (optional) id of the task that created the checkpoint

@@ -305,8 +305,11 @@ struct server_slot {
             return false;
         }
 
+        const bool hp = llama_hprof_enabled(); // [prefill2] LLAMA_HOST_PROF: prompt-cache save split
+        int64_t hp_t0 = hp ? ggml_time_us() : 0;
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (hp) { llama_hprof_record("psave.size", hp_t0); hp_t0 = ggml_time_us(); }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -314,20 +317,25 @@ struct server_slot {
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep);
+        if (hp) { llama_hprof_record("psave.alloc", hp_t0); hp_t0 = ggml_time_us(); }
         if (cur == nullptr) {
             return false;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (hp) { llama_hprof_record("psave.get_tgt", hp_t0); hp_t0 = ggml_time_us(); }
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        if (hp) { llama_hprof_record("psave.get_dft", hp_t0); }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        if (hp_t0) llama_hprof_record("pload", hp_t0);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2390,8 +2398,12 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t hp_ck0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2] LLAMA_HOST_PROF
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (hp_ck0) llama_hprof_record("srv.ckpt.create.tgt", hp_ck0);
+        const int64_t hp_ck1 = llama_hprof_enabled() ? ggml_time_us() : 0;
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (hp_ck1) llama_hprof_record("srv.ckpt.create.dft", hp_ck1);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -3451,8 +3463,12 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        const int64_t hp_cr0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (hp_cr0) llama_hprof_record("srv.ckpt.restore.tgt", hp_cr0);
+                                        const int64_t hp_cr1 = llama_hprof_enabled() ? ggml_time_us() : 0;
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (hp_cr1) llama_hprof_record("srv.ckpt.restore.dft", hp_cr1);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 

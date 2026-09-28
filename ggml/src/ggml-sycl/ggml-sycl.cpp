@@ -6978,7 +6978,88 @@ static int ggml_sycl_gtime_mode() {
 
 static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend, ggml_cgraph * cgraph);
 
+// ---- LOCAL (prefill2) GGML_SYCL_GPU_TIMELINE=N (default 0): non-blocking GPU timeline of prefill-size graphs
+//      (first MUL_MAT with > 16 rows). After each such graph a SYCL host_task is queued (in-order queue: it runs when the
+//      graph's device work is done) and records the completion time. Per graph kind (n_nodes, n_tokens):
+//        submit = host time spent enqueueing the graph,
+//        gap    = enqueue start - completion of the previous marked graph (> 0: the device had nothing of ours queued
+//                 from the previous prefill graph's end until this graph was enqueued, except unmarked copies/graphs),
+//        busy   = completion - max(enqueue start, previous completion) (device time of this graph incl. anything queued
+//                 in between, e.g. the h_nextn D2H copy after the previous graph).
+//      Prints every N marked graphs and at exit. Adds one host round trip (~tens of us) per prefill graph.
+struct ggml_sycl_tl_acc { int64_t n = 0; double submit = 0, gap = 0, busy = 0, gap_max = 0; };
+static std::mutex g_sycl_tl_mtx;
+static std::map<std::pair<int, int64_t>, ggml_sycl_tl_acc> g_sycl_tl;
+static double  g_sycl_tl_last_done = -1.0;   // ms, steady clock
+static int64_t g_sycl_tl_count = 0;
+static double ggml_sycl_tl_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void ggml_sycl_tl_print_locked() {
+    for (auto & kv : g_sycl_tl) {
+        const auto & a = kv.second;
+        if (a.n == 0) continue;
+        fprintf(stderr, "[gpu-timeline] n_nodes=%5d n_tokens=%5lld graphs=%6lld submit=%.3f gap=%.3f (max %.1f) busy=%.3f ms/graph | totals gap=%.1f busy=%.1f ms\n",
+                kv.first.first, (long long) kv.first.second, (long long) a.n, a.submit / a.n, a.gap / a.n, a.gap_max,
+                a.busy / a.n, a.gap, a.busy);
+    }
+    fflush(stderr);
+}
+static void ggml_sycl_tl_print() {
+    std::lock_guard<std::mutex> lk(g_sycl_tl_mtx);
+    ggml_sycl_tl_print_locked();
+}
+static int ggml_sycl_tl_mode() {
+    static int every = -1;
+    if (every < 0) {
+        const char * e = getenv("GGML_SYCL_GPU_TIMELINE");
+        every = e ? std::max(0, atoi(e)) : 0;
+        if (every > 0) std::atexit(ggml_sycl_tl_print);
+    }
+    return every;
+}
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    const int tl_every = ggml_sycl_tl_mode();
+    if (tl_every > 0 && !g_ggml_sycl_graph_recording) {
+        int64_t n_tokens = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
+        }
+        if (n_tokens > 16) {
+            auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+            const double t_enq0 = ggml_sycl_tl_now_ms();
+            const ggml_status st = ggml_backend_sycl_graph_compute_timed(backend, cgraph);
+            const double t_enq1 = ggml_sycl_tl_now_ms();
+            const std::pair<int, int64_t> key(cgraph->n_nodes, n_tokens);
+            sycl_ctx->stream()->submit([=](sycl::handler & h) {
+                h.host_task([=]() {
+                    const double t_done = ggml_sycl_tl_now_ms();
+                    std::lock_guard<std::mutex> lk(g_sycl_tl_mtx);
+                    auto & a = g_sycl_tl[key];
+                    double prev = g_sycl_tl_last_done;
+                    // a gap of > 1.5 s is idle time between requests: print the finished segment and start a new one
+                    if (prev >= 0 && t_enq0 - prev > 1500.0) {
+                        fprintf(stderr, "[gpu-timeline] ---- segment end (idle %.0f ms) ----\n", t_enq0 - prev);
+                        ggml_sycl_tl_print_locked();
+                        g_sycl_tl.clear();
+                        prev = -1.0;
+                    }
+                    const double gap  = prev < 0 ? 0.0 : std::max(0.0, t_enq0 - prev);
+                    a.n++;
+                    a.submit += t_enq1 - t_enq0;
+                    a.gap    += gap;
+                    a.gap_max = std::max(a.gap_max, gap);
+                    a.busy   += t_done - (prev < 0 ? t_enq0 : std::max(t_enq0, prev));
+                    g_sycl_tl_last_done = t_done;
+                    if (++g_sycl_tl_count % tl_every == 0) {
+                        ggml_sycl_tl_print_locked();
+                    }
+                });
+            });
+            return st;
+        }
+    }
     const int every = ggml_sycl_gtime_mode();
     if (every <= 0) {
         return ggml_backend_sycl_graph_compute_timed(backend, cgraph);

@@ -100,6 +100,16 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// [prefill2] MTP hidden states kept on the device during prompt processing (common/speculative.cpp, env
+// LLAMA_MTP_H_DEVICE=1). link: allocates the shared [n_embd, n_batch + 1] f32 device tensor in the target context
+// (false: unsupported, nothing changed). batch_ok: the target keeps the h rows of this batch on the device (token batch,
+// > 16 tokens, one sequence); then only the last row of each ubatch is copied to the host. begin/end bracket the draft
+// decode of such a batch (the draft batch has no embd; begin uploads the pending row = device row 0).
+LLAMA_API bool llama_mtp_h_dev_link(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+LLAMA_API bool llama_mtp_h_dev_batch_ok(const struct llama_context * ctx_tgt, const struct llama_batch * batch);
+LLAMA_API void llama_mtp_h_dev_begin(struct llama_context * ctx_dft, const float * pending_row);
+LLAMA_API void llama_mtp_h_dev_end(struct llama_context * ctx_dft);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
