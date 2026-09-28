@@ -55,6 +55,13 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// [decodeidle] LLAMA_TGT_TOPK_DEVICE: k of the chain's leading top-k sampler if every sampler before it is a no-op and
+// there is no grammar / reasoning budget / mirostat (else 0); mark the sampler's context as computing the top k+1
+// candidates on the device (0 = off); number of rows that fell back to the raw logits because of equal values
+int32_t common_sampler_chain_top_k(const struct common_sampler * gsmpl);
+void    common_sampler_set_tgt_topk_device(struct common_sampler * gsmpl, int32_t k);
+int64_t common_sampler_tgt_topk_fallbacks(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

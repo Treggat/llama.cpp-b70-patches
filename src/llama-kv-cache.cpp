@@ -362,8 +362,55 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // [decodeidle] LLAMA_KV_ROT_DEVICE=1 (default 0): device copies of the rotation matrices (same values, uploaded once)
+    {
+        const char * e = getenv("LLAMA_KV_ROT_DEVICE");
+        if (e && atoi(e) != 0 && (attn_rot_k || attn_rot_v) && !hparams.no_alloc && ctxs_bufs.size() == 1) {
+            ggml_init_params params = {
+                /* .mem_size   = */ 2*ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            rot_dev_ctx.reset(ggml_init(params));
+            const int nk = attn_rot_k ? rot_nrot_k() : 0;
+            const int nv = attn_rot_v ? 64 : 0;
+            if (nk) {
+                rot_dev_k = ggml_new_tensor_2d(rot_dev_ctx.get(), GGML_TYPE_F32, nk, nk);
+                ggml_set_name(rot_dev_k, "attn_k_rot_dev");
+            }
+            if (nv) {
+                rot_dev_v = ggml_new_tensor_2d(rot_dev_ctx.get(), GGML_TYPE_F32, nv, nv);
+                ggml_set_name(rot_dev_v, "attn_v_rot_dev");
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
+            rot_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rot_dev_ctx.get(), buft));
+            if (rot_dev_buf && (!rot_dev_k || attn_rot_hadamard.count(nk)) && (!rot_dev_v || attn_rot_hadamard.count(nv))) {
+                if (rot_dev_k) {
+                    ggml_backend_tensor_set(rot_dev_k, attn_rot_hadamard.at(nk).data(), 0, ggml_nbytes(rot_dev_k));
+                }
+                if (rot_dev_v) {
+                    ggml_backend_tensor_set(rot_dev_v, attn_rot_hadamard.at(nv).data(), 0, ggml_nbytes(rot_dev_v));
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_KV_ROT_DEVICE: rotation matrices on %s (k %d, v %d)\n", __func__,
+                               ggml_backend_buffer_name(rot_dev_buf.get()), nk, nv);
+            } else {
+                rot_dev_k = rot_dev_v = nullptr;
+                rot_dev_buf.reset();
+                rot_dev_ctx.reset();
+            }
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+int llama_kv_cache::rot_nrot_k() const {
+    int nrot = 64;
+    do {
+        nrot *= 2;
+    } while (n_embd_head_k_all % nrot == 0);
+    return nrot / 2;
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1463,6 +1510,10 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    if (attn_rot_k && rot_dev_k) {
+        return rot_dev_k; // [decodeidle] LLAMA_KV_ROT_DEVICE
+    }
+
     if (attn_rot_k) {
         int nrot = 64;
 
@@ -1483,6 +1534,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
+
+    if (attn_rot_v && rot_dev_v) {
+        return rot_dev_v; // [decodeidle] LLAMA_KV_ROT_DEVICE
+    }
 
     if (attn_rot_v) {
         int nrot = 64;
@@ -2054,6 +2109,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == rot_dev_k) {
+        return; // [decodeidle] LLAMA_KV_ROT_DEVICE: filled once at init
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -2063,6 +2121,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == rot_dev_v) {
+        return; // [decodeidle] LLAMA_KV_ROT_DEVICE: filled once at init
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

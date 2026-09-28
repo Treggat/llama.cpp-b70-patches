@@ -289,6 +289,14 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // [decodeidle] LLAMA_KV_ROT_DEVICE=1: the K / V rotation matrices live in a device buffer of their own (filled once)
+    // instead of being graph inputs that are copied to the device before every graph
+    ggml_context_ptr        rot_dev_ctx;
+    ggml_backend_buffer_ptr rot_dev_buf;
+    ggml_tensor *           rot_dev_k = nullptr;
+    ggml_tensor *           rot_dev_v = nullptr;
+    int                     rot_nrot_k() const;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 

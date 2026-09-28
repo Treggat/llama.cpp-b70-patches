@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// [decodeidle] LLAMA_TGT_TOPK_DEVICE: output row i of the last decode's raw logits, read from the device now (blocking).
+// Valid only until the next decode on ctx; nullptr if the row cannot be fetched (e.g. reordered outputs).
+LLAMA_API float * llama_get_logits_ith_fetch(struct llama_context * ctx, int32_t i);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

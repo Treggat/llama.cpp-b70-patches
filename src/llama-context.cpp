@@ -796,10 +796,21 @@ static int llama_hprof_mode() {
     }
     return every;
 }
+// [decodeidle] the phases are also recorded as host intervals of the GGML_TRACE timeline (ggml-backend.h)
+static bool llama_hprof_on() {
+    static const bool on = llama_hprof_mode() > 0 || ggml_trace_on();
+    return on;
+}
 static void llama_hprof_add(const std::string & key, int64_t t0_us) {
-    auto & a = g_llama_hprof[key];
-    a.n++;
-    a.ms += (ggml_time_us() - t0_us) / 1000.0;
+    const int64_t t1_us = ggml_time_us();
+    if (llama_hprof_mode() > 0) {
+        auto & a = g_llama_hprof[key];
+        a.n++;
+        a.ms += (t1_us - t0_us) / 1000.0;
+    }
+    if (ggml_trace_on()) {
+        ggml_trace_host(key.c_str(), t0_us, t1_us, 0);
+    }
 }
 
 // [hostv] env LLAMA_SYNC_SKIP_IDLE=1 (default 0): llama_synchronize() on a context that has submitted no graph since its
@@ -826,7 +837,7 @@ void llama_context::synchronize() {
     sched_pending = false;
 
     {
-        const int64_t t0 = llama_hprof_mode() > 0 ? ggml_time_us() : 0;
+        const int64_t t0 = llama_hprof_on() ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
         if (t0 && n_queued_tokens > 0) {
             llama_hprof_add(std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".sync_wait", t0);
@@ -1022,6 +1033,27 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+float * llama_context::get_logits_ith_fetch(int32_t i) {
+    output_reorder();
+    if (logits.data == nullptr || fetch_t_logits == nullptr || !fetch_sorted) {
+        return nullptr;
+    }
+    int64_t j;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception &) {
+        return nullptr;
+    }
+    if (j < fetch_row0 || j >= fetch_row0 + fetch_n || fetch_t_logits->ne[0] != (int64_t) model.vocab.n_tokens()) {
+        return nullptr;
+    }
+    synchronize();
+    const int64_t n_vocab = model.vocab.n_tokens();
+    ggml_backend_tensor_get(fetch_t_logits, logits.data + j*n_vocab, (size_t) (j - fetch_row0)*fetch_t_logits->nb[1],
+                            (size_t) n_vocab*sizeof(float));
+    return logits.data + j*n_vocab;
 }
 
 float * llama_context::get_embeddings() {
@@ -1522,8 +1554,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    const bool hprof = llama_hprof_mode() > 0;
-    const std::string hp_tag = std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".n" + std::to_string(ubatch.n_tokens);
+    const bool hprof = llama_hprof_on();
+    const std::string hp_tag = hprof ? std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".n" + std::to_string(ubatch.n_tokens) : std::string();
     int64_t hp_t0 = hprof ? ggml_time_us() : 0;
     bool hp_reused = false;
 
@@ -1979,7 +2011,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // [spechost] LLAMA_HOST_PROF: host time of the batch/memory preparation before the first ubatch
-    const bool    hp_dec   = llama_hprof_mode() > 0;
+    const bool    hp_dec   = llama_hprof_on();
     const int64_t hp_dec_t = hp_dec ? ggml_time_us() : 0;
     const std::string hp_dec_tag = hp_dec ? std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + (batch_inp.n_tokens <= 16 ? "" : ".pp") : std::string();
 
@@ -2160,6 +2192,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+        // [decodeidle] remember where this ubatch's logits live on the device (llama_get_logits_ith_fetch)
+        fetch_t_logits = (t_logits && n_outputs > 0) ? t_logits : nullptr;
+        fetch_row0     = n_outputs_prev;
+        fetch_n        = n_outputs;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
         const int64_t hp_ex_t0 = hp_dec ? ggml_time_us() : 0; // [draftcost] output extraction enqueue
 
@@ -2302,6 +2338,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_outputs = n_outputs_all;
 
     // set output mappings
+    fetch_sorted = false;
     if (n_outputs > 0) {
         bool sorted_output = true;
 
@@ -2316,6 +2353,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 sorted_output = false;
             }
         }
+
+        fetch_sorted = sorted_output || n_outputs == 1;
 
         // make the outputs have the same order they had in the user-provided batch
         // note: this is mostly relevant for recurrent models atm
@@ -4322,6 +4361,11 @@ float * llama_get_logits(llama_context * ctx) {
     return ctx->get_logits();
 }
 
+float * llama_get_logits_ith_fetch(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_logits_ith_fetch(i);
+}
+
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
@@ -4739,11 +4783,11 @@ int32_t llama_encode(
 
 // exported hook so common/ and tools/ can record phases into the same LLAMA_HOST_PROF table
 bool llama_hprof_enabled(void) {
-    return llama_hprof_mode() > 0;
+    return llama_hprof_on();
 }
 
 void llama_hprof_record(const char * key, int64_t t0_us) {
-    if (llama_hprof_mode() > 0) {
+    if (llama_hprof_on()) {
         llama_hprof_add(key, t0_us);
     }
 }
@@ -4763,10 +4807,12 @@ int32_t llama_decode(
         }
         if (batch.n_tokens <= 16) have_small = true;
     }
-    const int64_t hp_t0 = hp_every > 0 ? ggml_time_us() : 0;
+    const int64_t hp_t0 = llama_hprof_on() ? ggml_time_us() : 0;
     const int ret = ctx->decode(batch);
-    if (hp_every > 0) {
+    if (hp_t0) {
         llama_hprof_add(std::string(ctx->get_cparams().embeddings_nextn_masked ? "dft" : "tgt") + ".llama_decode_call", hp_t0);
+    }
+    if (hp_every > 0) {
         if (++g_llama_hprof_decodes % hp_every == 0) {
             llama_hprof_print();
         }

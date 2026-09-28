@@ -35,6 +35,9 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <set>
 #include <tuple>
 #include <cstring>
@@ -43,6 +46,7 @@
 #include <unistd.h>
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
+#include <sycl/ext/oneapi/experimental/profiling_tag.hpp> // [decodeidle] GGML_TRACE device tags
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
 #include <level_zero/zes_api.h>
@@ -729,10 +733,25 @@ catch (sycl::exception const &exc) {
   GGML_SYCL_EXIT_OR_RETHROW();
 }
 
+// [decodeidle] GGML_TRACE: host interval of a blocking buffer copy
+struct ggml_sycl_trace_host_scope {
+    const char * name; int64_t arg; int64_t t0;
+    ggml_sycl_trace_host_scope(const char * n, int64_t a) : name(n), arg(a), t0(ggml_trace_on() ? ggml_time_us() : 0) {}
+    ~ggml_sycl_trace_host_scope() { if (t0) ggml_trace_host(name, t0, ggml_time_us(), arg); }
+};
+static inline void ggml_sycl_trace_tag(sycl::queue & q, const char * name, int64_t arg);
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
                                                 size_t size) try {
+    ggml_sycl_trace_host_scope tr_scope("sycl.bset", (int64_t) size); // [decodeidle]
+    if (ggml_trace_on() && getenv("GGML_TRACE_BSET_NAMES")) {
+        static std::set<std::string> seen;
+        if (seen.insert(tensor->name).second) {
+            GGML_LOG_INFO("[trace] blocking set_tensor: '%s' %zu bytes (op %s)\n", tensor->name, size, ggml_op_name(tensor->op));
+        }
+    }
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -774,6 +793,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *tensor,
                                                 void *data, size_t offset,
                                                 size_t size) try {
+    ggml_sycl_trace_host_scope tr_scope("sycl.bget", (int64_t) size); // [decodeidle]
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -6107,6 +6127,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
+    ggml_sycl_trace_tag(*stream, "h2d", (int64_t) size); // [decodeidle]
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -6128,6 +6149,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
+    ggml_sycl_trace_tag(*stream, "d2h", (int64_t) size); // [decodeidle]
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -6169,7 +6191,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    const int64_t tr_t0 = ggml_trace_on() ? ggml_time_us() : 0; // [decodeidle]
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    if (tr_t0) {
+        ggml_trace_host("sycl.sync", tr_t0, ggml_time_us(), 0);
+    }
 
     GGML_UNUSED(backend);
 }
@@ -7177,7 +7203,179 @@ static int ggml_sycl_tl_mode() {
     return every;
 }
 
+// ---- LOCAL (decodeidle) GGML_TRACE=<file> (default off): device timestamps for the ggml timeline trace (ggml-backend.h).
+//      A profiling tag (sycl_ext_oneapi_profiling_tag: a device timestamp written when all earlier work of the in-order
+//      queue is done, no host round trip, no wait) is submitted before and after each graph and after each async copy;
+//      the host submission time is recorded with it. Tags are resolved (device ns read back) only at ggml_trace_flush(),
+//      followed by idle-queue calibration tags that map the device clock onto ggml_time_us(). Host intervals: graph
+//      submission (g.submit), backend synchronize (sycl.sync), blocking buffer copies (sycl.bset / sycl.bget).
+//      Cost when on: ~2 tag submissions per graph; when off: one static bool test.
+static int g_sycl_trace_last_mode = -1; // set by the graph cache: 0 eager, 1 replay, 2 record+replay
+struct ggml_sycl_trace_tag_t { sycl::event ev; int64_t t_host; const char * name; int64_t arg; };
+static std::vector<ggml_sycl_trace_tag_t> g_sycl_trace_tags;
+static sycl::queue * g_sycl_trace_q = nullptr;
+static std::mutex g_sycl_trace_mtx;
+
+static void ggml_sycl_trace_resolve() {
+    std::lock_guard<std::mutex> lk(g_sycl_trace_mtx);
+    for (auto & tg : g_sycl_trace_tags) {
+        try {
+            tg.ev.wait();
+            const uint64_t ns = tg.ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            ggml_trace_dev(tg.name, tg.t_host, (int64_t) ns, tg.arg);
+        } catch (std::exception const & e) {
+            ggml_trace_dev("tag_error", tg.t_host, 0, tg.arg);
+        }
+    }
+    g_sycl_trace_tags.clear();
+    if (g_sycl_trace_q) {
+        // clock calibration on an idle queue: device ns of a tag vs host us around its submission (arg = window us)
+        for (int k = 0; k < 16; ++k) {
+            g_sycl_trace_q->wait();
+            const int64_t t0 = ggml_time_us();
+            sycl::event ev = sycl_ex::submit_profiling_tag(*g_sycl_trace_q);
+            ev.wait();
+            const int64_t t1 = ggml_time_us();
+            const uint64_t ns = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            ggml_trace_dev("calib", t0, (int64_t) ns, t1 - t0);
+        }
+    }
+}
+
+// GGML_TRACE_DEV=1 (default with GGML_TRACE): no extra device commands. The event of the last command in the in-order
+// queue (sycl_ext_oneapi_in_order_queue_events get_last_event) is handed to a poller thread, which spins on the head
+// event's status and records its completion time on the host clock (resolution ~ a few us). Records "dev.<name>" host
+// intervals [submission time, completion time]. =2: profiling tags (see above; they cost ~0.3 ms host per tag on the
+// B70, so they distort the timeline). 0: no device records.
+struct ggml_sycl_trace_poll_item { sycl::event ev; int64_t t_host; const char * name; int64_t arg; };
+static std::mutex                             g_sycl_tpoll_mtx;
+static std::condition_variable                g_sycl_tpoll_cv;
+static std::deque<ggml_sycl_trace_poll_item>  g_sycl_tpoll_q;
+static std::atomic<bool>                      g_sycl_tpoll_stop{ false };
+static std::thread                            g_sycl_tpoll_thread;
+static void ggml_sycl_trace_poller() {
+    char nm[48];
+    while (true) {
+        ggml_sycl_trace_poll_item it;
+        {
+            std::unique_lock<std::mutex> lk(g_sycl_tpoll_mtx);
+            g_sycl_tpoll_cv.wait(lk, [] { return !g_sycl_tpoll_q.empty() || g_sycl_tpoll_stop.load(); });
+            if (g_sycl_tpoll_q.empty()) {
+                return;
+            }
+            it = g_sycl_tpoll_q.front();
+            g_sycl_tpoll_q.pop_front();
+        }
+        int64_t t_done = 0;
+        try {
+            while (!g_sycl_tpoll_stop.load(std::memory_order_relaxed) &&
+                   it.ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+                for (int k = 0; k < 64; ++k) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    __builtin_ia32_pause();
+#endif
+                }
+            }
+            t_done = g_sycl_tpoll_stop.load() ? -1 : ggml_time_us();
+        } catch (...) {
+            t_done = -1;
+        }
+        snprintf(nm, sizeof(nm), "dev.%s", it.name);
+        ggml_trace_host(nm, it.t_host, t_done, it.arg);
+    }
+}
+static int ggml_sycl_trace_dev_mode() {
+    static const int m = getenv("GGML_TRACE_DEV") ? atoi(getenv("GGML_TRACE_DEV")) : 1;
+    return m;
+}
+
+static bool ggml_sycl_trace_ok(sycl::queue & q) {
+    static int ok = -1;
+    if (ok < 0) {
+        ok = 0;
+        if (ggml_trace_on()) {
+            if (ggml_sycl_trace_dev_mode() == 1) {
+                ok = 1;
+                g_sycl_tpoll_thread = std::thread(ggml_sycl_trace_poller);
+                std::atexit([] {
+                    g_sycl_tpoll_stop = true;
+                    g_sycl_tpoll_cv.notify_all();
+                    if (g_sycl_tpoll_thread.joinable()) {
+                        g_sycl_tpoll_thread.join();
+                    }
+                    std::lock_guard<std::mutex> lk(g_sycl_tpoll_mtx);
+                    g_sycl_tpoll_q.clear();
+                });
+            } else if (ggml_sycl_trace_dev_mode() == 2) {
+                if (q.get_device().has(sycl::aspect::ext_oneapi_queue_profiling_tag)) {
+                    ok = 1;
+                    ggml_trace_set_resolver(ggml_sycl_trace_resolve);
+                } else {
+                    GGML_LOG_WARN("GGML_TRACE: device lacks ext_oneapi_queue_profiling_tag, no device timestamps\n");
+                }
+            }
+        }
+    }
+    return ok == 1;
+}
+
+static inline void ggml_sycl_trace_tag(sycl::queue & q, const char * name, int64_t arg) {
+    if (!ggml_sycl_trace_ok(q) || g_ggml_sycl_graph_recording) {
+        return;
+    }
+    // GGML_TRACE_TAGS bitmask (default 15): 1 g.pre, 2 g.post, 4 h2d, 8 d2h
+    static const int mask = getenv("GGML_TRACE_TAGS") ? atoi(getenv("GGML_TRACE_TAGS")) : 15;
+    const int bit = name[0] == 'g' ? (name[2] == 'p' && name[3] == 'r' ? 1 : 2) : (name[0] == 'h' ? 4 : 8);
+    if (!(mask & bit)) {
+        return;
+    }
+    const int64_t t = ggml_time_us();
+    if (ggml_sycl_trace_dev_mode() == 1) {
+        if (bit == 1) {
+            return; // the poller derives starts from completions + submission times
+        }
+        std::optional<sycl::event> ev = q.ext_oneapi_get_last_event();
+        if (!ev) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_sycl_tpoll_mtx);
+            g_sycl_tpoll_q.push_back({ *ev, t, name, arg });
+        }
+        g_sycl_tpoll_cv.notify_one();
+        return;
+    }
+    sycl::event ev = sycl_ex::submit_profiling_tag(q);
+    std::lock_guard<std::mutex> lk(g_sycl_trace_mtx);
+    g_sycl_trace_tags.push_back({ ev, t, name, arg });
+    g_sycl_trace_q = &q;
+}
+
+static ggml_status ggml_backend_sycl_graph_compute_traced(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    auto * sycl_ctx0 = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (!ggml_sycl_trace_ok(*sycl_ctx0->stream())) {
+        return ggml_backend_sycl_graph_compute_traced(backend, cgraph);
+    }
+    int64_t n_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
+    }
+    int64_t arg = (int64_t) cgraph->n_nodes | (n_tokens << 20);
+    sycl::queue & q = *sycl_ctx0->stream();
+    ggml_sycl_trace_tag(q, "g.pre", arg);
+    g_sycl_trace_last_mode = -1;
+    const int64_t t0 = ggml_time_us();
+    const ggml_status st = ggml_backend_sycl_graph_compute_traced(backend, cgraph);
+    const int64_t t1 = ggml_time_us();
+    arg |= (int64_t) (g_sycl_trace_last_mode + 1) << 40;
+    ggml_trace_host("g.submit", t0, t1, arg);
+    ggml_sycl_trace_tag(q, "g.post", arg);
+    return st;
+}
+
+static ggml_status ggml_backend_sycl_graph_compute_traced(ggml_backend_t backend, ggml_cgraph * cgraph) {
     const int tl_every = ggml_sycl_tl_mode();
     if (tl_every > 0 && !g_ggml_sycl_graph_recording) {
         int64_t n_tokens = 0;
@@ -7718,6 +7916,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
             }
             g_gstat_too_big_reason[why]++;
         }
+        g_sycl_trace_last_mode = 0;
         ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
         return;
     }
@@ -7786,6 +7985,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
 
     if (e.exec) {
         g_gstat_replay++;
+        g_sycl_trace_last_mode = 1;
         ggml_sycl_gstat_timer tp(cfg.stats > 0 ? &g_gstat_t_replay_us : nullptr);
         ctx->stream()->ext_oneapi_graph(*e.exec);
         return;
@@ -7794,6 +7994,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
     if (e.no_graph || e.seen < cfg.warmup) {
         e.seen++;
         g_gstat_eager++;
+        g_sycl_trace_last_mode = 0;
         {
             ggml_sycl_gstat_timer te(cfg.stats > 0 ? &g_gstat_t_eager_us : nullptr);
             g_gstat_n_eager_timed += cfg.stats > 0 ? 1 : 0;
@@ -7835,6 +8036,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
         return;
     }
     g_gstat_record++;
+    g_sycl_trace_last_mode = 2;
     e.exec = std::move(exec);
     if (cfg.selftest == 2) {
         return;  // negative control for the selftest harness: poisoned outputs are NOT recomputed -> tests must fail
@@ -8540,7 +8742,11 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
   GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
 
   sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
+  const int64_t tr_t0 = ggml_trace_on() ? ggml_time_us() : 0; // [decodeidle]
   SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+  if (tr_t0) {
+      ggml_trace_host("sycl.event_sync", tr_t0, ggml_time_us(), 0);
+  }
 } catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;

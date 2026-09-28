@@ -419,6 +419,12 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: backend chain {top_k(k+1)} attached to ctx_tgt for this slot's seq (kept
+    // across requests; attaching / detaching re-reserves the scheduler)
+    llama_sampler * tgt_topk_chain = nullptr;
+    int32_t         tgt_topk_k     = 0;     // k of tgt_topk_chain
+    bool            tgt_topk_set   = false; // tgt_topk_chain is the sampler of this seq on ctx_tgt
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -469,7 +475,11 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // [decodeidle] LLAMA_TGT_TOPK_DEVICE: keep the top-k chain attached across requests (attaching / detaching
+        // re-reserves the scheduler); the next launch detaches it if that request cannot use it
+        if (!tgt_topk_set) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1923,10 +1933,45 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // [decodeidle] LLAMA_TGT_TOPK_DEVICE=1 (default 0): when the CPU chain starts with top-k (everything before it a
+            // no-op, see common_sampler_chain_top_k), the target computes the top k+1 logits of each output row on the
+            // device and only those are copied to the host instead of the whole vocab row (~1 MB per row). The CPU chain
+            // then runs on them; a row whose k+1 values are not all distinct is re-read in full (exact, see sampling.cpp)
+            static const bool tgt_topk_env = [] {
+                const char * e = getenv("LLAMA_TGT_TOPK_DEVICE");
+                return e && atoi(e) != 0;
+            }();
+            const int32_t tgt_topk_k = (tgt_topk_env && !use_backend_sampling && task.params.sampling.n_probs == 0)
+                ? common_sampler_chain_top_k(slot.smpl.get()) : 0;
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
+                slot.tgt_topk_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            } else if (tgt_topk_k > 0 && tgt_topk_k < 1024) {
+                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k) {
+                    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(tgt_topk_k + 1));
+                    if (slot.tgt_topk_set) {
+                        llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                        slot.tgt_topk_set = false;
+                    }
+                    if (slot.tgt_topk_chain) {
+                        llama_sampler_free(slot.tgt_topk_chain);
+                    }
+                    slot.tgt_topk_chain = chain;
+                    slot.tgt_topk_k     = tgt_topk_k;
+                }
+                if (!slot.tgt_topk_set) {
+                    slot.tgt_topk_set = llama_set_sampler(ctx_tgt, slot.id, slot.tgt_topk_chain);
+                    SLT_INF(slot, "LLAMA_TGT_TOPK_DEVICE: target top-%d candidates on the device: %s\n", tgt_topk_k + 1,
+                            slot.tgt_topk_set ? "on" : "FAILED (full logits)");
+                }
+                if (slot.tgt_topk_set) {
+                    common_sampler_set_tgt_topk_device(slot.smpl.get(), tgt_topk_k);
+                }
             } else {
+                slot.tgt_topk_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
 
@@ -2963,6 +3008,10 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                if (ggml_trace_on()) {
+                    ggml_trace_flush(); // [decodeidle] GGML_TRACE: resolve device tags + write the trace while idle
+                }
 
                 return; // skip further processing
 
@@ -4171,6 +4220,12 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (ggml_trace_on()) { // [decodeidle] GGML_TRACE: drafted | accepted << 8 | position << 16
+                    const int64_t tr_t = ggml_time_us();
+                    ggml_trace_host("srv.spec_result", tr_t, tr_t, (int64_t) n_draft | ((int64_t) (accepted.size() - 1) << 8) |
+                                    ((int64_t) slot.prompt.n_tokens() << 16));
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

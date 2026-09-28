@@ -1684,8 +1684,27 @@ static bool ggml_sched_async_inputs_env() {
     return on;
 }
 
-static bool ggml_sched_input_stageable(const ggml_tensor * input, const ggml_tensor * input_cpy) {
-    return (input->flags & GGML_TENSOR_FLAG_INPUT) && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+// [decodeidle] GGML_SYCL_ASYNC_INPUTS=2: also stage split inputs that a CPU split computed in host memory (e.g. the
+// token-embedding GET_ROWS of the target and of the MTP draft, whose tok_embd stays on the host). Without it such an
+// input waits for the whole device queue (ggml_backend_synchronize: no sched events with one copy) and is then copied
+// with a blocking set_tensor, so e.g. the first MTP draft decode of a step cannot be submitted before the catch-up
+// graph has finished. The CPU backend computes synchronously, so the bytes are final when they are captured; the
+// in-order queue orders the upload after every earlier graph that still reads the destination.
+static bool ggml_sched_async_cpu_inputs_env() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SYCL_ASYNC_INPUTS");
+        return e && atoi(e) >= 2;
+    }();
+    return on;
+}
+
+static bool ggml_sched_input_stageable(const ggml_tensor * input, const ggml_tensor * input_cpy,
+                                       ggml_backend_t input_backend = nullptr) {
+    const bool src_ok = (input->flags & GGML_TENSOR_FLAG_INPUT) ||
+                        (ggml_sched_async_cpu_inputs_env() && input_backend &&
+                         ggml_backend_get_device(input_backend) &&
+                         ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU);
+    return src_ok && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
            input->data && ggml_is_contiguous(input) && input_cpy->buffer && ggml_nbytes(input) == ggml_nbytes(input_cpy);
 }
 
@@ -1867,7 +1886,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             size_t st_total = 0;
             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
                 struct ggml_tensor * input = split->inputs[input_id];
-                if (ggml_sched_input_stageable(input, tensor_copy(input, split_backend_id, sched->cur_copy))) {
+                if (ggml_sched_input_stageable(input, tensor_copy(input, split_backend_id, sched->cur_copy),
+                                               ggml_backend_sched_get_tensor_backend(sched, input))) {
                     st_total += GGML_PAD(ggml_nbytes(input), 256);
                 }
             }
@@ -1899,7 +1919,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
 
-            if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
+            if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy, input_backend)) {
                 // [spechost] staged upload: capture the bytes now, upload from the pinned ring without blocking
                 const size_t n = ggml_nbytes(input);
                 char * src = sched->istage->base + st_off;
@@ -2895,4 +2915,113 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+// ---- [decodeidle] LOCAL timeline trace (GGML_TRACE=<file>, default off) ----
+#include <mutex>
+namespace {
+struct ggml_trace_rec {
+    char    kind;       // 'H' host interval, 'D' device timestamp
+    char    name[39];
+    int64_t t0;         // H: start us, D: host us when the tag was submitted
+    int64_t t1;         // H: end us,   D: device ns
+    int64_t arg;
+};
+struct ggml_trace_state {
+    std::mutex                  mtx;
+    std::vector<ggml_trace_rec> recs;
+    FILE *                      f        = nullptr;
+    void (*resolver)(void)              = nullptr;
+    bool                        on       = false;
+    size_t                      cap      = 1u << 20;
+};
+ggml_trace_state & ggml_trace_st() {
+    static ggml_trace_state st;
+    return st;
+}
+void ggml_trace_write_locked(ggml_trace_state & st) {
+    if (!st.f) {
+        return;
+    }
+    for (const auto & r : st.recs) {
+        fprintf(st.f, "%c %s %lld %lld %lld\n", r.kind, r.name, (long long) r.t0, (long long) r.t1, (long long) r.arg);
+    }
+    fflush(st.f);
+    st.recs.clear();
+}
+void ggml_trace_push(char kind, const char * name, int64_t t0, int64_t t1, int64_t arg) {
+    auto & st = ggml_trace_st();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    ggml_trace_rec r;
+    r.kind = kind;
+    size_t i = 0;
+    for (; name && name[i] && i < sizeof(r.name) - 1; ++i) {
+        r.name[i] = (name[i] == ' ' || name[i] == '\n') ? '_' : name[i];
+    }
+    r.name[i] = 0;
+    r.t0 = t0; r.t1 = t1; r.arg = arg;
+    st.recs.push_back(r);
+    if (st.recs.size() >= st.cap) {
+        ggml_trace_write_locked(st);
+    }
+}
+void ggml_trace_atexit() {
+    ggml_trace_flush();
+}
+} // namespace
+
+bool ggml_trace_on(void) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_TRACE");
+        if (!e || !*e || strcmp(e, "0") == 0) {
+            return false;
+        }
+        auto & st = ggml_trace_st();
+        st.f = fopen(e, "a");
+        if (!st.f) {
+            GGML_LOG_WARN("GGML_TRACE: cannot open %s, tracing off\n", e);
+            return false;
+        }
+        st.recs.reserve(st.cap);
+        st.on = true;
+        GGML_LOG_INFO("GGML_TRACE: timeline trace -> %s\n", e);
+        atexit(ggml_trace_atexit);
+        return true;
+    }();
+    return on;
+}
+
+void ggml_trace_host(const char * name, int64_t t0_us, int64_t t1_us, int64_t arg) {
+    if (ggml_trace_on()) {
+        ggml_trace_push('H', name, t0_us, t1_us, arg);
+    }
+}
+
+void ggml_trace_dev(const char * name, int64_t t_host_us, int64_t dev_ns, int64_t arg) {
+    if (ggml_trace_on()) {
+        ggml_trace_push('D', name, t_host_us, dev_ns, arg);
+    }
+}
+
+void ggml_trace_set_resolver(void (*fn)(void)) {
+    auto & st = ggml_trace_st();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    st.resolver = fn;
+}
+
+void ggml_trace_flush(void) {
+    if (!ggml_trace_on()) {
+        return;
+    }
+    auto & st = ggml_trace_st();
+    void (*fn)(void) = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        fn = st.resolver;
+    }
+    if (fn) {
+        fn(); // pushes 'D' records (takes the lock itself)
+    }
+    std::lock_guard<std::mutex> lk(st.mtx);
+    ggml_trace_write_locked(st);
 }

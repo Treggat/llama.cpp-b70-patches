@@ -440,6 +440,16 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // [decodeidle] LOCAL timeline trace, env GGML_TRACE=<file> (default off; every call is a no-op when off).
+    // Records host intervals (ggml_time_us clock) and device timestamps (backend clock, ns) into memory; the records
+    // are written to <file> by ggml_trace_flush() (and when the buffer fills up, and at exit). A backend registers a
+    // resolver that turns its pending device tags into ggml_trace_dev() records before a flush.
+    GGML_API bool ggml_trace_on(void);
+    GGML_API void ggml_trace_host(const char * name, int64_t t0_us, int64_t t1_us, int64_t arg);
+    GGML_API void ggml_trace_dev (const char * name, int64_t t_host_us, int64_t dev_ns, int64_t arg);
+    GGML_API void ggml_trace_set_resolver(void (*fn)(void));
+    GGML_API void ggml_trace_flush(void);
+
 #ifdef  __cplusplus
 }
 #endif

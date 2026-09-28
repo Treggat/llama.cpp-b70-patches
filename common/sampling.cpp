@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-ext.h" // [decodeidle] llama_get_logits_ith_fetch
 
 #include "ggml.h"
 
@@ -131,7 +132,30 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // the original host path over a raw logits row
+    void set_logits_raw(const float * logits, int n_vocab) {
+        // [step-proto] the chain's first effective sampler is top_k(k): select the k best logits in one
+        // pass instead of materialising n_vocab token_data and partial-sorting them (same set, same order)
+        const int32_t k = fast_top_k();
+        if (k > 0 && k < n_vocab) {
+            select_top_k(logits, n_vocab, k);
+            if (fast_top_k_mode() == 2) {
+                check_top_k(logits, n_vocab, k);
+            }
+            cur_p = { cur.data(), cur.size(), -1, true };
+            return;
+        }
+
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // force_full [decodeidle]: the caller needs the whole vocab row (grammar before the chain, reasoning-budget forcing,
+    // grammar resampling); only relevant when the device computed the top-k candidates (LLAMA_TGT_TOPK_DEVICE)
+    void set_logits(struct llama_context * ctx, int idx, bool force_full = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -140,6 +164,62 @@ struct common_sampler {
         const llama_vocab * vocab = llama_model_get_vocab(model);
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        // [decodeidle] LLAMA_TGT_TOPK_DEVICE: the device returned the top_k+1 logits of this row. The host path over the
+        // full row keeps exactly the top_k of them in the same order unless two of those k+1 values are equal (then the
+        // order of the equal ones depends on the selection algorithm): in that case, and whenever the caller needs the
+        // whole row, the raw row is read from the device and the original path runs. NaNs also fail the strict test.
+        const int32_t k_dev = tgt_topk_device_k();
+        if (k_dev > 0 && !sampled_probs && sampled_logits) {
+            const uint32_t cnt = llama_get_sampled_logits_count_ith(ctx, idx);
+            bool full = force_full || cnt != (uint32_t) k_dev + 1;
+            if (!full) {
+                topk_vals.assign(sampled_logits, sampled_logits + cnt);
+                std::sort(topk_vals.begin(), topk_vals.end(), std::greater<float>());
+                bool distinct = true;
+                for (size_t i = 0; i + 1 < topk_vals.size(); ++i) {
+                    distinct = distinct && (topk_vals[i] > topk_vals[i + 1]);
+                }
+                if (!distinct) {
+                    full = true;
+                    n_topk_fallback++;
+                }
+            } else {
+                n_topk_full++;
+            }
+            if (full) {
+                const float * row = llama_get_logits_ith_fetch(ctx, idx);
+                GGML_ASSERT(row != nullptr && "LLAMA_TGT_TOPK_DEVICE: cannot read the raw logits row");
+                set_logits_raw(row, n_vocab);
+                return;
+            }
+            cur.resize(cnt);
+            for (uint32_t i = 0; i < cnt; i++) {
+                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+            }
+            cur_p = { cur.data(), cur.size(), -1, false };
+            if (tgt_topk_check_mode()) {
+                // LLAMA_TGT_TOPK_DEVICE=2: compare with the full-row selection, abort on any difference, continue with it
+                std::vector<llama_token_data> got(cur.begin(), cur.end());
+                std::stable_sort(got.begin(), got.end(), [](const llama_token_data & x, const llama_token_data & y) { return x.logit > y.logit; });
+                got.resize(k_dev);
+                const float * row = llama_get_logits_ith_fetch(ctx, idx);
+                GGML_ASSERT(row != nullptr);
+                select_top_k(row, n_vocab, k_dev);
+                for (int i = 0; i < k_dev; ++i) {
+                    if (got[i].id != cur[i].id || memcmp(&got[i].logit, &cur[i].logit, sizeof(float)) != 0) {
+                        GGML_ABORT("LLAMA_TGT_TOPK_DEVICE=2: candidate %d differs: id %d vs %d", i, got[i].id, cur[i].id);
+                    }
+                }
+                static int64_t n_ok = 0;
+                if ((++n_ok & (n_ok - 1)) == 0) {
+                    LOG_INF("%s: LLAMA_TGT_TOPK_DEVICE=2: %lld rows identical to the full-row selection (%lld tie fallbacks, %lld full-row reads)\n",
+                            __func__, (long long) n_ok, (long long) n_topk_fallback, (long long) n_topk_full);
+                }
+                set_logits_raw(row, n_vocab);
+            }
+            return;
+        }
 
         if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
@@ -156,27 +236,26 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-
-            // [step-proto] the chain's first effective sampler is top_k(k): select the k best logits in one
-            // pass instead of materialising n_vocab token_data and partial-sorting them (same set, same order)
-            const int32_t k = fast_top_k();
-            if (k > 0 && k < n_vocab) {
-                select_top_k(logits, n_vocab, k);
-                if (fast_top_k_mode() == 2) {
-                    check_top_k(logits, n_vocab, k);
-                }
-                cur_p = { cur.data(), cur.size(), -1, true };
-                return;
-            }
-
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-            }
+            set_logits_raw(logits, n_vocab);
+            return;
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
     }
+
+    // [decodeidle] LLAMA_TGT_TOPK_DEVICE=1: k of the chain's leading top-k when this sampler's context computes the
+    // top_k+1 candidates on the device (set by the server through common_sampler_set_tgt_topk_device), else 0
+    int32_t tgt_topk_device_k() const {
+        return tgt_topk_k;
+    }
+    int32_t tgt_topk_k = 0;
+    static bool tgt_topk_check_mode() {
+        static const bool v = getenv("LLAMA_TGT_TOPK_DEVICE") && atoi(getenv("LLAMA_TGT_TOPK_DEVICE")) == 2;
+        return v;
+    }
+    int64_t n_topk_fallback = 0;
+    int64_t n_topk_full     = 0;
+    std::vector<float> topk_vals;
 
     // env LLAMA_SAMPLER_FAST_TOPK=1: returns top_k when everything the chain runs before top-k is a no-op
     // (no logit bias / suppress list, neutral penalties, DRY and top-n-sigma off) and no grammar or reasoning
@@ -188,8 +267,13 @@ struct common_sampler {
     }
 
     int32_t fast_top_k() const {
-        const bool enabled = fast_top_k_mode() != 0;
-        if (!enabled || grmr || rbudget || params.mirostat != 0 || params.top_k <= 0) {
+        return fast_top_k_mode() != 0 ? chain_top_k_first() : 0;
+    }
+
+    // top_k when everything the chain runs before top-k is a no-op (and no grammar / reasoning budget), else 0
+    // relaxed [decodeidle]: grammar and reasoning budget allowed (the caller handles them per row with set_logits(force_full))
+    int32_t chain_top_k_first(bool relaxed = false) const {
+        if ((!relaxed && (grmr || rbudget)) || params.mirostat != 0 || params.top_k <= 0) {
             return 0;
         }
         const int n = llama_sampler_chain_n(chain);
@@ -718,6 +802,21 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
     }
 }
 
+// [decodeidle] LLAMA_TGT_TOPK_DEVICE
+int32_t common_sampler_chain_top_k(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->chain_top_k_first(/*relaxed =*/ true) : 0;
+}
+
+void common_sampler_set_tgt_topk_device(struct common_sampler * gsmpl, int32_t k) {
+    if (gsmpl) {
+        gsmpl->tgt_topk_k = k;
+    }
+}
+
+int64_t common_sampler_tgt_topk_fallbacks(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->n_topk_fallback : 0;
+}
+
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return nullptr;
@@ -739,7 +838,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: a grammar applied before the chain or a forcing reasoning budget sees the whole row
+    const bool need_full = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
+                           (grammar_first && grammar_should_apply(gsmpl));
+    gsmpl->set_logits(ctx, idx, need_full);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -793,7 +895,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(ctx, idx, /*force_full =*/ true);
 
     llama_sampler_apply(rbudget,  &cur_p);
 

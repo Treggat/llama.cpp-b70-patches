@@ -81,6 +81,12 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: read output row i of the last decode's logits from the device (blocking)
+    float * get_logits_ith_fetch(int32_t i);
+    ggml_tensor *  fetch_t_logits  = nullptr; // logits tensor of the last ubatch of the last decode
+    int64_t        fetch_row0      = 0;       // its first output row
+    int64_t        fetch_n         = 0;
+    bool           fetch_sorted    = false;   // outputs were not reordered
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
