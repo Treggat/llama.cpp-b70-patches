@@ -337,6 +337,7 @@ dnn_u4_prims & dnn_u4_get_prims(ggml_backend_sycl_context & ctx, const queue_ptr
     attr.set_fpmath_mode(fpmath_mode::f16, true);
     attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { 32, 1 }, memory::data_type::f16);
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    if (getenv("GGML_SYCL_DNN_DETERMINISTIC") && atoi(getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0) { attr.set_deterministic(true); }   // LOCAL: see gemm.hpp
     // f16 output by default: the f32-output primitive selects a slower kernel on this device (GGML_SYCL_DNN_U4_F32DST=1 to try it)
     static const bool want_f32 = getenv("GGML_SYCL_DNN_U4_F32DST") && atoi(getenv("GGML_SYCL_DNN_U4_F32DST")) != 0;
     matmul::primitive_desc pd;
@@ -371,6 +372,7 @@ dnn_u4_prims & dnn_u4_get_prims(ggml_backend_sycl_context & ctx, const queue_ptr
         po.append_sum(1.0f);
         cattr.set_post_ops(po);
         cattr.set_scratchpad_mode(scratchpad_mode::user);
+        if (getenv("GGML_SYCL_DNN_DETERMINISTIC") && atoi(getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0) { cattr.set_deterministic(true); }
         matmul::primitive_desc cpd(eng, a_md, b_md, c_md, cattr);
         p.corr         = matmul(cpd);
         p.corr_scratch = cpd.scratchpad_desc().get_size();

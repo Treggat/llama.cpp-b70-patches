@@ -40,6 +40,7 @@
 #include <cstring>
 #include <string>
 #include <cstdio>
+#include <unistd.h>
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
@@ -6747,6 +6748,141 @@ static int ggml_sycl_gdn_gather_target(const ggml_cgraph * cgraph, int node_idx)
     return -1;
 }
 
+// ---- LOCAL: GGML_SYCL_NODE_HASH=N (default 0 = off): determinism probe. For every graph whose widest MUL_MAT has
+//      N columns (tokens; -1 = every graph), wait after each node group and log a 64-bit hash of the output bytes of
+//      every node (and of the inputs of the group's first node) to GGML_SYCL_NODE_HASH_FILE.<pid> (default stderr).
+//      The hash is computed on the device (fixed 4 KiB chunks, fixed order), so it is itself deterministic. Nodes
+//      that a fusion folded into a later node are marked "fused" (their buffers may not be written), and GET_ROWS
+//      nodes that GGML_SYCL_GDN_GATHER folds into the GATED_DELTA_NET node get an "NF" line (never written). Graph recording cannot wait, so a
+//      recorded graph is not hashed: run with GGML_SYCL_ENABLE_GRAPH=0 for the hashed batch size.
+static int ggml_sycl_node_hash_ntok() {
+    static const int v = ggml_sycl_get_env("GGML_SYCL_NODE_HASH", 0);
+    return v;
+}
+
+struct ggml_sycl_node_hasher {
+    FILE *     f        = nullptr;
+    uint64_t * d_chunks = nullptr;
+    size_t     cap      = 0;
+    int64_t    graph_no = 0;
+    std::vector<uint64_t> h_chunks;
+
+    FILE * out() {
+        if (f == nullptr) {
+            const char * p = getenv("GGML_SYCL_NODE_HASH_FILE");
+            if (p != nullptr && *p) {
+                char name[1024];
+                snprintf(name, sizeof(name), "%s.%d", p, (int) getpid());
+                f = fopen(name, "a");
+            }
+            if (f == nullptr) {
+                f = stderr;
+            }
+        }
+        return f;
+    }
+
+    uint64_t hash(sycl::queue & q, const void * ptr, size_t n) {
+        if (ptr == nullptr || n == 0) {
+            return 0;
+        }
+        const size_t CH = 4096;
+        const size_t nch = (n + CH - 1) / CH;
+        if (nch > cap) {
+            if (d_chunks) {
+                sycl::free(d_chunks, q);
+            }
+            cap      = std::max(nch, (size_t) 1 << 16);
+            d_chunks = sycl::malloc_device<uint64_t>(cap, q);
+        }
+        uint64_t *      dc = d_chunks;
+        const uint8_t * b  = (const uint8_t *) ptr;
+        q.parallel_for(sycl::range<1>(nch), [=](sycl::id<1> id) {
+             const size_t c   = id[0];
+             const size_t beg = c * CH;
+             const size_t end = beg + CH < n ? beg + CH : n;
+             uint64_t     h   = 0xcbf29ce484222325ull ^ (uint64_t) c;
+             for (size_t j = beg; j < end; ++j) {
+                 h = (h ^ b[j]) * 0x100000001b3ull;
+             }
+             dc[c] = h;
+         }).wait();
+        h_chunks.resize(nch);
+        q.memcpy(h_chunks.data(), dc, nch * sizeof(uint64_t)).wait();
+        uint64_t h = 0x9e3779b97f4a7c15ull ^ n;
+        for (size_t c = 0; c < nch; ++c) {
+            h ^= h_chunks[c] + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+
+    uint64_t hash_tensor(sycl::queue & q, const ggml_tensor * t) {
+        return t && t->data ? hash(q, t->data, ggml_nbytes(t)) : 0;
+    }
+};
+
+static ggml_sycl_node_hasher g_sycl_node_hasher;
+
+static bool ggml_sycl_node_hash_want(const ggml_cgraph * cgraph) {
+    const int want = ggml_sycl_node_hash_ntok();
+    if (want == 0 || g_ggml_sycl_graph_recording) {
+        return false;
+    }
+    int64_t ntok = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1]) {
+            ntok = std::max(ntok, n->src[1]->ne[1]);
+        }
+    }
+    return want < 0 || ntok == want;
+}
+
+// hash the outputs of nodes [from, to) (to = the next group's first node); skipped = fused-away intermediates
+static void ggml_sycl_node_hash_group(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, int from, int to) {
+    sycl::queue & q = *ctx->stream();
+    q.wait();
+    FILE * f = g_sycl_node_hasher.out();
+    int last = -1;
+    for (int j = from; j < to && j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!ggml_sycl_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            last = j;
+        }
+    }
+    for (int j = from; j < to && j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        char ins[512];
+        int  off = 0;
+        ins[0]   = 0;
+        if (j == from) {
+            for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+                off += snprintf(ins + off, sizeof(ins) - off, "%s%016" PRIx64, s ? "," : "",
+                                g_sycl_node_hasher.hash_tensor(q, n->src[s]));
+            }
+        }
+        fprintf(f, "NH g=%" PRId64 " i=%d op=%s t=%s ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " %s out=%016" PRIx64 " in=%s name=%s\n",
+                g_sycl_node_hasher.graph_no, j, ggml_op_desc(n), ggml_type_name(n->type), n->ne[0], n->ne[1],
+                n->ne[2], n->ne[3], j == last ? "last" : "fused", g_sycl_node_hasher.hash_tensor(q, n), ins, n->name);
+    }
+}
+
+// inputs of the group's first node must be hashed BEFORE it runs (in-place ops overwrite them)
+static void ggml_sycl_node_hash_inputs(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, int i) {
+    sycl::queue & q = *ctx->stream();
+    q.wait();
+    const ggml_tensor * n = cgraph->nodes[i];
+    FILE * f = g_sycl_node_hasher.out();
+    fprintf(f, "NI g=%" PRId64 " i=%d", g_sycl_node_hasher.graph_no, i);
+    for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+        fprintf(f, " %016" PRIx64, g_sycl_node_hasher.hash_tensor(q, n->src[s]));
+    }
+    fprintf(f, " name=%s\n", n->name);
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_op_prof_graph_begin(cgraph);
@@ -6757,6 +6893,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     int                 gdn_gather_at[64];
     int                 n_gdn_gather = 0;
 
+    const bool nh      = ggml_sycl_node_hash_want(cgraph);
+    int        nh_from = 0;   // first node of the group that has not been hashed yet
+    if (nh) {
+        g_sycl_node_hasher.graph_no++;
+        fprintf(g_sycl_node_hasher.out(), "NG g=%" PRId64 " n_nodes=%d\n", g_sycl_node_hasher.graph_no, cgraph->n_nodes);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -6764,6 +6907,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (nh) {
+            if (i > nh_from) {
+                ggml_sycl_node_hash_group(sycl_ctx, cgraph, nh_from, i);
+            }
+            nh_from = i;
+            ggml_sycl_node_hash_inputs(sycl_ctx, cgraph, i);
         }
 
         if (node->op == GGML_OP_GET_ROWS && g_ggml_sycl_enable_fusion && ggml_sycl_gdn_gather_enabled() &&
@@ -6773,6 +6923,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 gdn_gather_gr[n_gdn_gather] = node;
                 gdn_gather_at[n_gdn_gather] = at;
                 ++n_gdn_gather;
+                if (nh) {
+                    fprintf(g_sycl_node_hasher.out(), "NF g=%" PRId64 " i=%d gather folded into node %d\n",
+                            g_sycl_node_hasher.graph_no, i, at);
+                }
                 static bool noted = false;
                 if (!noted) {
                     noted = true;
@@ -6900,6 +7054,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    if (nh) {
+        ggml_sycl_node_hash_group(sycl_ctx, cgraph, nh_from, cgraph->n_nodes);
+        fflush(g_sycl_node_hasher.out());
     }
     ggml_sycl_op_prof_graph_end();
 }

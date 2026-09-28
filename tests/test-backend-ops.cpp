@@ -58,7 +58,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
+        // LOCAL (determinism): TBO_SEED=S makes the data reproducible across processes (per-chunk engine seeded from
+        // S, the tensor size and the chunk start), so outputs of two builds / env settings can be compared bit for bit
+        static const char * seed_env = getenv("TBO_SEED");
         auto init_thread = [&](size_t start, size_t end) {
+            if (seed_env) {
+                std::default_random_engine gen((unsigned) (atoll(seed_env) * 1000003ull + nels * 7919ull + start));
+                std::uniform_real_distribution<float> distribution(min, max);
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(gen);
+                }
+                return;
+            }
             thread_local std::default_random_engine gen(std::random_device{}());
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
@@ -1599,9 +1610,55 @@ struct test_case {
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
 
+        // LOCAL (determinism): TBO_REPEAT=N recomputes the graph N more times on backend1 with the same inputs and
+        // compares the output bytes with the first run (the result of the compare above): any difference = the op
+        // is not run-to-run reproducible. Prints one [repeat] line per case; a difference fails the case.
+        bool repeat_ok = true;
+        if (const char * rep_env = getenv("TBO_REPEAT")) {
+            const int reps = atoi(rep_env);
+            const size_t nb = ggml_nbytes(out);
+            std::vector<uint8_t> ref(nb), cur(nb);
+            ggml_backend_tensor_get(out, ref.data(), 0, nb);
+            int ndiff_runs = 0;
+            size_t ndiff_max = 0;
+            double maxabs = 0.0;
+            for (int r = 0; r < reps; ++r) {
+                ggml_backend_graph_compute(backend1, gf);
+                ggml_backend_tensor_get(out, cur.data(), 0, nb);
+                if (memcmp(ref.data(), cur.data(), nb) != 0) {
+                    ++ndiff_runs;
+                    size_t nd = 0;
+                    if (out->type == GGML_TYPE_F32) {
+                        const float * a = (const float *) ref.data();
+                        const float * b = (const float *) cur.data();
+                        for (size_t i = 0; i < nb / 4; ++i) {
+                            if (memcmp(&a[i], &b[i], 4) != 0) {
+                                ++nd;
+                                maxabs = std::max(maxabs, (double) std::fabs(a[i] - b[i]));
+                            }
+                        }
+                    } else {
+                        for (size_t i = 0; i < nb; ++i) {
+                            nd += ref[i] != cur[i];
+                        }
+                    }
+                    ndiff_max = std::max(ndiff_max, nd);
+                }
+            }
+            repeat_ok = ndiff_runs == 0;
+            uint64_t h0 = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < nb; ++i) {
+                h0 = (h0 ^ ref[i]) * 0x100000001b3ull;
+            }
+            printf("[repeat-hash] %s %s: %016llx\n", current_op_name.c_str(), vars().c_str(), (unsigned long long) h0);
+            printf("[repeat] %s %s: %d/%d runs differ from run 0, max %zu differing values of %zu, max |diff| %.3e\n",
+                   current_op_name.c_str(), vars().c_str(), ndiff_runs, reps, ndiff_max,
+                   out->type == GGML_TYPE_F32 ? nb / 4 : nb, maxabs);
+        }
+
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = ud.ok && cmp_ok && repeat_ok;
+        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : !repeat_ok ? "not reproducible" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -9338,9 +9395,51 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// LOCAL (determinism): the house-model matmul shapes for TBO_REPEAT (eval) and perf (env DETERM_ONLY=1)
+static std::vector<std::unique_ptr<test_case>> make_test_cases_determ() {
+    std::vector<std::unique_ptr<test_case>> test_cases;
+    // LOCAL (determinism): DETERM_ONLY=1 keeps only the house-model prefill matmul shapes (weights M x K as the model
+    // has them, DETERM_NC="176,1222" token counts, default below), for TBO_REPEAT=N run-to-run comparisons.
+    // DETERM_SHAPES="M:K:type,..." (type = q4_K / q6_K / f16 / f32) replaces the weight list.
+    std::vector<int> ncs = { 33, 62, 100, 128, 176, 256, 512, 1000, 1222, 1536, 1537, 2047, 2048 };
+    if (const char * e = getenv("DETERM_NC")) {
+        ncs.clear();
+        for (const char * q = e; *q; ) { ncs.push_back(atoi(q)); while (*q && *q != ',') { q++; } if (*q) { q++; } }
+    }
+    std::vector<std::tuple<int, int, ggml_type>> ws = {
+        {17408, 5120, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q6_K},
+        {10240, 5120, GGML_TYPE_Q4_K}, {10240, 5120, GGML_TYPE_Q6_K}, {6144, 5120, GGML_TYPE_Q4_K},
+        {5120, 6144, GGML_TYPE_Q4_K}, {12288, 5120, GGML_TYPE_Q4_K}, {1024, 5120, GGML_TYPE_Q4_K},
+        {1024, 5120, GGML_TYPE_Q6_K}, {5120, 10240, GGML_TYPE_Q4_K}, {48, 5120, GGML_TYPE_Q4_K} };
+    if (const char * e = getenv("DETERM_SHAPES")) {
+        ws.clear();
+        for (const char * q = e; *q; ) {
+            int m = 0, k = 0; char tn[16] = {0};
+            if (sscanf(q, "%d:%d:%15[^,]", &m, &k, tn) == 3) {
+                const std::string t(tn);
+                const ggml_type ty = t == "q4_K" ? GGML_TYPE_Q4_K : t == "q6_K" ? GGML_TYPE_Q6_K :
+                                     t == "q8_0" ? GGML_TYPE_Q8_0 : t == "f16" ? GGML_TYPE_F16 :
+                                     t == "bf16" ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+                ws.emplace_back(m, k, ty);
+            }
+            while (*q && *q != ',') { q++; } if (*q) { q++; }
+        }
+    }
+    for (int nc : ncs) {
+        for (auto [m, k, t] : ws) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, nc, k, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    return test_cases;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    if (getenv("DETERM_ONLY")) {
+        return make_test_cases_determ();
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -11666,6 +11765,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("DETERM_ONLY")) {
+        return make_test_cases_determ();
+    }
 
     // LOCAL (prefillx): every op class of one house-model prefill ubatch (Qwen3.8-27B qwen35 Q4_K_M: 48 gated-delta
     // + 16 attention layers + the MTP layer) at 512 / 1024 / 2048 tokens and KV depth 0 / 32k / 64k / 96k. env

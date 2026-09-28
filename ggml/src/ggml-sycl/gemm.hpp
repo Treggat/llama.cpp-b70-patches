@@ -20,6 +20,12 @@
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <tuple>
+
 class DnnlGemmWrapper {
 public:
     using dt = dnnl::memory::data_type;
@@ -33,6 +39,36 @@ public:
         else if constexpr (std::is_same_v<T, sycl::ext::oneapi::bfloat16>) return dt::bf16;
 #endif
         else static_assert(0);
+    }
+
+    // LOCAL: GGML_SYCL_DNN_DETERMINISTIC (default 0)
+    static bool dnn_deterministic() {
+        static const bool v = [] {
+            const char * e = getenv("GGML_SYCL_DNN_DETERMINISTIC");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        return v;
+    }
+
+    // LOCAL: GGML_SYCL_DNN_LOG=1 prints the oneDNN implementation chosen for every new gemm shape (stderr, once)
+    static void dnn_log_impl(int m, int n, int k, int at, int bt, int ct, dnnl_dim_t ba, dnnl_dim_t bb,
+                             const dnnl::matmul::primitive_desc & pd) {
+        static const bool on = [] {
+            const char * e = getenv("GGML_SYCL_DNN_LOG");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (!on) {
+            return;
+        }
+        static std::mutex mtx;
+        static std::set<std::tuple<int, int, int, int, int, int, long, long>> seen;
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!seen.insert({ m, n, k, at, bt, ct, (long) ba, (long) bb }).second) {
+            return;
+        }
+        fprintf(stderr, "[SYCL-DNN] gemm m=%d n=%d k=%d dt=%d/%d/%d batch=%ld/%ld det=%d scratch=%zu impl=%s\n", m, n,
+                k, at, bt, ct, (long) ba, (long) bb, (int) dnn_deterministic(), pd.scratchpad_desc().get_size(),
+                pd.impl_info_str());
     }
 
     static void gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
@@ -60,11 +96,18 @@ public:
 #ifdef GGML_SYCL_F16
         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
 #endif
+        // LOCAL: GGML_SYCL_DNN_DETERMINISTIC=1 asks oneDNN for run-to-run reproducible kernels. Without it the
+        // gemm picks, for some shapes (e.g. N = 176 / 1222 tokens), a k-parallel kernel that reduces its partial
+        // sums with global float atomics, so identical inputs give different bits from run to run.
+        if (dnn_deterministic()) {
+            primitive_attr.set_deterministic(true);
+        }
 
         auto a_mem = dnnl::memory(a_in_md, eng, const_cast<void*>(a));
         auto b_mem = dnnl::memory(b_in_md, eng, const_cast<void*>(b));
         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_in_md, b_in_md, c_md, primitive_attr);
         auto c_mem = dnnl::memory(matmul_pd.dst_desc(), eng, c);
+        dnn_log_impl(m, n, k, (int) at, (int) bt, (int) ct, batches_a, batches_b, matmul_pd);
 
         const auto scratchpad_md = matmul_pd.scratchpad_desc();
         ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
