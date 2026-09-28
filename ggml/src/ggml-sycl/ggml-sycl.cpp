@@ -740,6 +740,19 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
+    // LOCAL (prefillx) GGML_SYCL_H2D_DIRECT=1 (default 0): a source in USM host (pinned) memory - llama's graph-input
+    // buffers, i.e. every per-ubatch KQ mask - is copied to the device directly. The malloc + memcpy bounce below (a PVC
+    // workaround for mmap'ed model files) turns that pinned upload into a pageable one: ~2.2 GB/s measured on the B70,
+    // ~78 ms for the 172 MB mask of a 2048-token ubatch at 42k cells, per context. =2: every source directly (probe only)
+    static const int h2d_direct = [] {
+        const char * e = getenv("GGML_SYCL_H2D_DIRECT");
+        return e ? atoi(e) : 0;
+    }();
+    if (h2d_direct >= 2 ||
+        (h2d_direct == 1 && sycl::get_pointer_type(data, stream->get_context()) == sycl::usm::alloc::host)) {
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+        return;
+    }
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);

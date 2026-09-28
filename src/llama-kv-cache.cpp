@@ -1808,8 +1808,33 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// [prefillx] env LLAMA_KQ_MASK_HINT=1 (default 0): tag a prefill ubatch's KQ mask with GGML_KQ_MASK_HINT_CAUSAL (see ggml.h)
+// when it is exactly bottom-right causal over the first n_used KV cells, so a backend can run the attention with an
+// implicit causal mask (SYCL: GGML_SYCL_FA_CAUSAL). Checked from the cell positions in O(n_kv) per ubatch: one sequence,
+// every used cell carries it, cells 0 .. n_used-1 used with strictly increasing positions (no repeated M-RoPE image
+// positions), cells n_used .. n_kv-1 empty, and the ubatch's tokens are the last n_tokens used cells in order.
+// LLAMA_KQ_MASK_HINT=2 also scans every tagged mask against the hint and aborts on any difference (test mode).
+// LLAMA_KQ_MASK_HINT=3 also marks the tagged f16 mask as not needing an upload (op_params[3] = 1, see below).
+static int llama_kq_mask_hint_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_HINT");
+        return e ? atoi(e) : 0;
+    }();
+    return mode;
+}
+
+// minimum ubatch size that gets the hint (the SYCL oneDNN attention serves >= 32 query tokens; smaller batches
+// keep op_params stable for the SYCL graph cache)
+static constexpr uint32_t LLAMA_KQ_MASK_HINT_MIN_TOKENS = 32;
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
+
+    // [prefillx] no hint unless proven below
+    dst->op_params[0] = 0;
+    dst->op_params[1] = 0;
+    dst->op_params[2] = 0;
+    dst->op_params[3] = 0;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -1843,13 +1868,86 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.fast             =*/ llama_kq_mask_fast_mode() > 0,
     };
 
-    if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
-    } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    // [prefillx] structure hint (from the cell positions, before the fill)
+    bool    hinted = false;
+    int64_t n_used = 0;
+    if (llama_kq_mask_hint_mode() > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+        n_stream == 1 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
+        const llama_seq_id s0 = ubatch->seq_id[0][0];
+        bool ok = true;
+        for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+            ok = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s0;
+        }
+        const auto & cells = v_cells.at(seq_to_stream[s0]);
+        ok = ok && cells.get_used() == cells.seq_n_cells(s0) && (int64_t) cells.size() >= n_kv;
+        if (ok) {
+            const llama_pos * P = cells.pos_data();
+            while (n_used < n_kv && P[n_used] >= 0) {
+                if (n_used > 0 && P[n_used] <= P[n_used - 1]) {
+                    ok = false;
+                    break;
+                }
+                n_used++;
+            }
+            for (int64_t j = n_used; ok && j < n_kv; ++j) {
+                ok = P[j] < 0;
+            }
+            ok = ok && n_used >= (int64_t) n_tokens;
+            for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+                ok = P[n_used - n_tokens + i] == ubatch->pos[i];
+            }
+        }
+        if (ok) {
+            hinted = true;
+            dst->op_params[0] = GGML_KQ_MASK_HINT_CAUSAL;
+            dst->op_params[1] = (int32_t) n_used;
+            dst->op_params[2] = (int32_t) n_tokens;
+            // mode 3 (f16 = flash-attention masks only): the backend may regenerate the mask from the hint, so the
+            // scheduler skips the upload (ggml-backend.cpp; SYCL rebuilds it on the device if a kernel needs the data)
+            dst->op_params[3] = (llama_kq_mask_hint_mode() == 3 && dst->type == GGML_TYPE_F16) ? 1 : 0;
+        }
     }
 
-    if (llama_kq_mask_fast_mode() == 2) {
+    // [prefillx] LLAMA_KQ_MASK_HINT_NOFILL=1 (with LLAMA_KQ_MASK_HINT=3): skip the host fill of a mask that is not
+    // uploaded. Only safe when no CPU-side op reads the mask (the scheduler keeps FLASH_ATTN_EXT on the GPU)
+    static const bool nofill = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_HINT_NOFILL");
+        return e && atoi(e) != 0;
+    }();
+    const bool filled = !(nofill && hinted && dst->op_params[3] == 1);
+
+    if (filled) {
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        }
+    }
+
+    if (llama_kq_mask_hint_mode() == 2 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
+        static int64_t n_tagged = 0, n_untagged = 0;
+        (hinted ? n_tagged : n_untagged)++;
+        if (hinted) {
+            const bool f16 = dst->type == GGML_TYPE_F16;
+            for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+                const int64_t last = n_used - n_tokens + i;
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const float v = f16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) dst->data)[i*n_kv + j])
+                                        : ((const float *) dst->data)[i*n_kv + j];
+                    if ((j <= last) ? (v != 0.0f) : (v != -INFINITY)) {
+                        GGML_ABORT("LLAMA_KQ_MASK_HINT mismatch at row %lld col %lld (n_used %lld, n_kv %lld)",
+                                   (long long) i, (long long) j, (long long) n_used, (long long) n_kv);
+                    }
+                }
+            }
+        }
+        if (((n_tagged + n_untagged) & (n_tagged + n_untagged - 1)) == 0) {
+            LLAMA_LOG_INFO("%s: LLAMA_KQ_MASK_HINT=2: %lld masks tagged and verified, %lld untagged (n_kv = %lld, n_used = %lld)\n",
+                           __func__, (long long) n_tagged, (long long) n_untagged, (long long) n_kv, (long long) n_used);
+        }
+    }
+
+    if (llama_kq_mask_fast_mode() == 2 && filled) {
         // test mode: rebuild with the reference path and compare bit for bit
         std::vector<uint8_t> ref(ggml_nbytes(dst));
         args_set_input_kq_mask args_ref = args;

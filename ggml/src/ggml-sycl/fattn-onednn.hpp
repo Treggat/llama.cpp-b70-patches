@@ -15,4 +15,9 @@ bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * 
 // execute the cached SDPA partition, write the f32 dst. Falls back to the TILE kernel on any failure.
 void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+// LOCAL (prefillx): a KQ mask carrying the GGML_KQ_MASK_HINT_CAUSAL hint with op_params[3] == 1 was not uploaded by the
+// scheduler (llama LLAMA_KQ_MASK_HINT=3); rebuild its data on the device from the hint before a kernel reads it
+// (op_params[3] = 2 afterwards). No-op for any other mask.
+void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask);
+
 #endif // GGML_SYCL_FATTN_ONEDNN_HPP

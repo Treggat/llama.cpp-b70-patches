@@ -2502,6 +2502,13 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // LOCAL (prefillx): structure hint a KQ-mask INPUT tensor may carry in its op_params, written by whoever fills the
+    // mask data (llama: the KV cache's set_input_kq_mask) and copied to the backend's copy of the input by
+    // ggml-backend's scheduler with the data: op_params[0] = GGML_KQ_MASK_HINT_CAUSAL, [1] = n_used, [2] = n_rows
+    // means the mask's first n_rows rows are exactly bottom-right causal over KV cells [0, n_used): row i holds 0 for
+    // cells 0 .. n_used - n_rows + i and -inf everywhere else. op_params[0] = 0: no hint. Backends may ignore it.
+    #define GGML_KQ_MASK_HINT_CAUSAL 0x4b514331
+
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
     // n_kv_max must bound the number of finite entries in every mask row.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(

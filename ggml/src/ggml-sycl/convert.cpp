@@ -1,4 +1,6 @@
 #include "convert.hpp"
+#include <type_traits>
+#include <vector>
 #include "dequantize.hpp"
 #include "presets.hpp"
 
@@ -337,6 +339,96 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
         [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
 }
+
+// LOCAL (prefillx) GGML_SYCL_Q6K_DQ_FAST=1 (default 0): q6_K (reorder layout) -> f16 for the prefill GEMM, 8
+// consecutive outputs per work-item (8-byte ql / qh loads, one 16-byte store) and 8 blocks per 256-item work-group,
+// instead of 4 strided 2-byte stores per item in 64-item groups. Every output is the same expression as
+// dequantize_block_q6_K_reorder (d * sc * (q - 32) with the same operand types), so the result is bit-identical.
+static void dequantize_row_q6_K_sycl_reorder_fast(const void * vx, sycl::half * yy, const int64_t k,
+                                                  dpct::queue_ptr stream) {
+    const int64_t nb = k / QK_K;
+    constexpr int64_t items_per_block = 32;   // 2 halves (ip) x 4 quarters x 4 groups of 8
+    constexpr int64_t wg              = 256;
+    const int64_t     n_items         = nb * items_per_block;
+    stream->parallel_for(sycl::nd_range<1>(((n_items + wg - 1) / wg) * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t gid = it.get_global_id(0);
+        if (gid >= n_items) {
+            return;
+        }
+        const int64_t ib  = gid / items_per_block;
+        const int     r   = (int) (gid % items_per_block);
+        const int     ip  = r / 16;          // 0..1: which 128-value half of the block
+        const int     qq  = (r / 4) % 4;     // 0..3: which 32-value quarter of the half
+        const int     il0 = (r % 4) * 8;     // 0, 8, 16, 24: first of 8 consecutive values
+
+        const uint8_t *   base_ptr   = static_cast<const uint8_t *>(vx);
+        const uint8_t *   ql_ptr     = base_ptr + ib * (QK_K / 2);
+        const uint8_t *   qh_ptr     = base_ptr + (QK_K / 2) * nb + (QK_K / 4) * ib;
+        const uint8_t *   scales_ptr = base_ptr + (QK_K / 2) * nb + (QK_K / 4) * nb + (QK_K / 16) * ib;
+        const ggml_half * d          = (const ggml_half *) (base_ptr + ((QK_K / 2) + (QK_K / 4) + (QK_K / 16)) * nb) + ib;
+
+        const int is = 8 * ip + il0 / 16;
+        const int8_t * sc = reinterpret_cast<const int8_t *>(scales_ptr + is);
+
+        const sycl::vec<uint8_t, 8> qlv =
+            *reinterpret_cast<const sycl::vec<uint8_t, 8> *>(ql_ptr + 64 * ip + 32 * (qq & 1) + il0);
+        const sycl::vec<uint8_t, 8> qhv = *reinterpret_cast<const sycl::vec<uint8_t, 8> *>(qh_ptr + 32 * ip + il0);
+
+        sycl::vec<sycl::half, 8> out;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const uint8_t ql = qlv[e];
+            const uint8_t qh = qhv[e];
+            sycl::half v;
+            if (qq == 0) {
+                v = *d * sc[0] * ((int8_t) ((ql & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+            } else if (qq == 1) {
+                v = *d * sc[2] * ((int8_t) ((ql & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+            } else if (qq == 2) {
+                v = *d * sc[4] * ((int8_t) ((ql >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+            } else {
+                v = *d * sc[6] * ((int8_t) ((ql >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+            }
+            out[e] = v;
+        }
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(yy + ib * QK_K + 128 * ip + 32 * qq + il0) = out;
+    });
+}
+
+template <typename dst_t>
+static void dequantize_row_q6_K_sycl_reorder_sel(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    static const bool fast = [] {
+        const char * e = getenv("GGML_SYCL_Q6K_DQ_FAST");
+        return e && atoi(e) != 0;
+    }();
+    if constexpr (std::is_same_v<dst_t, sycl::half>) {
+        if (fast && (k % QK_K) == 0 && ((uintptr_t) vx) % 8 == 0 && ((uintptr_t) y) % 16 == 0) {
+            dequantize_row_q6_K_sycl_reorder_fast(vx, y, k, stream);
+            // GGML_SYCL_Q6K_DQ_FAST=2 (test): also run the reference kernel and compare bit for bit (syncs)
+            static const bool verify = [] { const char * e = getenv("GGML_SYCL_Q6K_DQ_FAST"); return e && atoi(e) == 2; }();
+            if (verify) {
+                sycl::half * ref = sycl::malloc_device<sycl::half>(k, *stream);
+                dequantize_row_q6_K_sycl_reorder(vx, ref, k, stream);
+                std::vector<uint16_t> a(k), b(k);
+                stream->memcpy(a.data(), y, k * sizeof(uint16_t));
+                stream->memcpy(b.data(), ref, k * sizeof(uint16_t)).wait();
+                sycl::free(ref, *stream);
+                int64_t bad = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    bad += a[i] != b[i];
+                }
+                static int n_log = 0;
+                if (bad != 0 || n_log++ < 4) {
+                    fprintf(stderr, "GGML_SYCL_Q6K_DQ_FAST=2: %lld values, %lld differ\n", (long long) k, (long long) bad);
+                }
+                GGML_ASSERT(bad == 0);
+            }
+            return;
+        }
+    }
+    dequantize_row_q6_K_sycl_reorder(vx, y, k, stream);
+}
+
 
 template <typename dst_t>
 static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int64_t k,
@@ -705,7 +797,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             }
         case GGML_TYPE_Q6_K:
             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                return dequantize_row_q6_K_sycl_reorder;
+                return dequantize_row_q6_K_sycl_reorder_sel;
             } else {
                 return dequantize_row_q6_K_sycl;
             }

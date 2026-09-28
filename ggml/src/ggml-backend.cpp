@@ -1854,6 +1854,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            // [prefillx] an input's op_params travel with its data (e.g. the KQ-mask structure hint, ggml.h)
+            if (input->op == GGML_OP_NONE) {
+                memcpy(input_cpy->op_params, input->op_params, sizeof(input->op_params));
+                // a KQ mask whose producer marked it as regenerable from its hint (op_params[3] == 1, llama
+                // LLAMA_KQ_MASK_HINT=3) is not uploaded; the consuming backend rebuilds it if it needs the data
+                if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && input->op_params[3] == 1 &&
+                    input->type == GGML_TYPE_F16 &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+            }
+
             if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
                 // [spechost] staged upload: capture the bytes now, upload from the pinned ring without blocking
                 const size_t n = ggml_nbytes(input);

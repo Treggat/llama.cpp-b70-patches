@@ -189,6 +189,25 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// LOCAL (prefillx): bottom-right causal prefill mask: row i (i < n_q) sees KV cells 0 .. n_used - n_q + i, where
+// n_used = ne0 - pad; padded rows (i >= n_q) see nothing but cell 0
+static void init_tensor_kq_mask_causal(ggml_tensor * tensor, int64_t n_q, int64_t pad) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    GGML_TENSOR_LOCALS( int64_t, ne, tensor, ne);
+    const int64_t n_used = ne0 - pad;
+    GGML_ASSERT(n_used >= n_q);
+    std::vector<ggml_fp16_t> d((size_t) ne0*ne1*ne2*ne3);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int64_t i3 = 0; i3 < ne3; i3++) for (int64_t i2 = 0; i2 < ne2; i2++) for (int64_t i1 = 0; i1 < ne1; i1++) {
+        ggml_fp16_t * row = d.data() + ((i3*ne2 + i2)*ne1 + i1)*ne0;
+        const int64_t last = i1 < n_q ? n_used - n_q + i1 : 0;
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            row[i0] = i0 <= last ? zero : ninf;
+        }
+    }
+    ggml_backend_tensor_set(tensor, d.data(), 0, d.size()*sizeof(ggml_fp16_t));
+}
+
 static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
@@ -1667,11 +1686,65 @@ struct test_case {
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
 
+        // LOCAL (prefillx): TBO_H2D=1 times a host -> device upload (pageable std::vector) of every input tensor
+        // >= 16 MB, e.g. the KQ mask a prefill ubatch uploads
+        if (getenv("TBO_H2D")) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->op != GGML_OP_NONE || t->view_src || !t->buffer || ggml_nbytes(t) < (16u << 20)) {
+                    continue;
+                }
+                std::vector<uint8_t> hb(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, hb.data(), 0, hb.size());
+                double best = 1e30;
+                for (int r = 0; r < 3; ++r) {
+                    ggml_backend_synchronize(backend);
+                    const int64_t t0 = ggml_time_us();
+                    ggml_backend_tensor_set(t, hb.data(), 0, hb.size());
+                    ggml_backend_synchronize(backend);
+                    best = std::min(best, (double) (ggml_time_us() - t0));
+                }
+                printf("  [h2d %s %s %.1f MB: %.2f ms, %.1f GB/s]\n", current_op_name.c_str(), ggml_type_name(t->type),
+                       hb.size() / 1e6, best / 1e3, hb.size() / best / 1e3);
+                // the same from the device's pinned host buffer type (what llama's input buffers use when available)
+                ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+                if (hbt) {
+                    ggml_backend_buffer_t pb = ggml_backend_buft_alloc_buffer(hbt, hb.size());
+                    if (pb) {
+                        void * pp = ggml_backend_buffer_get_base(pb);
+                        memcpy(pp, hb.data(), hb.size());
+                        double bp = 1e30;
+                        for (int r = 0; r < 3; ++r) {
+                            ggml_backend_synchronize(backend);
+                            const int64_t t0 = ggml_time_us();
+                            ggml_backend_tensor_set(t, pp, 0, hb.size());
+                            ggml_backend_synchronize(backend);
+                            bp = std::min(bp, (double) (ggml_time_us() - t0));
+                        }
+                        printf("  [h2d-pinned %s %.1f MB: %.2f ms, %.1f GB/s]\n", current_op_name.c_str(), hb.size() / 1e6,
+                               bp / 1e3, hb.size() / bp / 1e3);
+                        ggml_backend_buffer_free(pb);
+                    }
+                }
+            }
+        }
+
         // warmup run
+        const int64_t t_warm0 = ggml_time_us();
         ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
+        }
+        // LOCAL (prefillx): TBO_WARMUP_MS=1 prints the first (warmup) run's wall time: kernel JIT / oneDNN primitive or
+        // SDPA partition compile for a new shape shows up here, not in the timed runs
+        if (getenv("TBO_WARMUP_MS")) {
+            ggml_backend_synchronize(backend);
+            const int64_t t_warm1 = ggml_time_us();
+            ggml_status s2 = ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            printf("  [warmup %s: first %.2f ms, second %.2f ms]\n", current_op_name.c_str(), (t_warm1 - t_warm0) / 1e3,
+                   (ggml_time_us() - t_warm1) / 1e3);
+            GGML_UNUSED(s2);
         }
 
         // determine number of runs
@@ -8131,6 +8204,22 @@ struct test_flash_attn_ext : public test_case {
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
+                } else if (getenv("TBO_FA_CAUSAL") && kv - (getenv("TBO_FA_CAUSAL_PAD") ? atoi(getenv("TBO_FA_CAUSAL_PAD")) : 0) >= nb) {
+                    // LOCAL (prefillx): a real prefill mask, the ubatch's nb tokens at the end of the used KV
+                    // (bottom-right causal), the last TBO_FA_CAUSAL_PAD cells unused (-inf); 0 / -inf only, as llama
+                    // builds it
+                    const int pad = getenv("TBO_FA_CAUSAL_PAD") ? atoi(getenv("TBO_FA_CAUSAL_PAD")) : 0;
+                    init_tensor_kq_mask_causal(t, nb, pad);
+                    // and the structure hint llama would attach (TBO_FA_CAUSAL=2: no hint, explicit mask only)
+                    if (atoi(getenv("TBO_FA_CAUSAL")) != 2) {
+                        t->op_params[0] = GGML_KQ_MASK_HINT_CAUSAL;
+                        t->op_params[1] = (int32_t) (t->ne[0] - pad);
+                        t->op_params[2] = (int32_t) nb;
+                        // TBO_FA_CAUSAL=3: also "not uploaded" (llama LLAMA_KQ_MASK_HINT=3); with SYCL
+                        // GGML_SYCL_FA_MASK_POISON=1 the backend's copy is poisoned, so a kernel that reads it without
+                        // regenerating it fails
+                        t->op_params[3] = atoi(getenv("TBO_FA_CAUSAL")) == 3 ? 1 : 0;
+                    }
                 } else {
                     init_tensor_kq_mask(t);
                 }
@@ -11577,6 +11666,62 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // LOCAL (prefillx): every op class of one house-model prefill ubatch (Qwen3.8-27B qwen35 Q4_K_M: 48 gated-delta
+    // + 16 attention layers + the MTP layer) at 512 / 1024 / 2048 tokens and KV depth 0 / 32k / 64k / 96k. env
+    // PREFILLX_ONLY=1 keeps just these (the rest of the perf list is skipped); PREFILLX_NC="2048" narrows the token counts
+    // PREFILLX_FA_SWEEP="nb:kv0:kv1:step" instead: only the f16 attention of an nb-token ubatch at kv = kv0..kv1
+    if (const char * e = getenv("PREFILLX_FA_SWEEP")) {
+        int nb = 2048, kv0 = 2048, kv1 = 100352, step = 2048;
+        sscanf(e, "%d:%d:%d:%d", &nb, &kv0, &kv1, &step);
+        for (int kv = kv0; kv <= kv1; kv += step) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+        return test_cases;
+    }
+    if (getenv("PREFILLX_ONLY")) {
+        std::vector<int> ncs = { 512, 1024, 2048 };
+        if (const char * e = getenv("PREFILLX_NC")) {
+            ncs.clear();
+            for (const char * p = e; *p; ) { ncs.push_back(atoi(p)); while (*p && *p != ',') { p++; } if (*p) { p++; } }
+        }
+        for (int nc : ncs) {
+            // weights as the model has them (M x K, type): q4_K everywhere, q6_K for half the ffn_down / GDN attn_qkv /
+            // attn_v; 5120 x 10240 = the MTP eh_proj; 48 x 5120 = ssm_alpha / ssm_beta
+            for (auto [nw, kw, t] : std::vector<std::tuple<int,int,ggml_type>>{
+                     {17408, 5120, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q6_K},
+                     {10240, 5120, GGML_TYPE_Q4_K}, {10240, 5120, GGML_TYPE_Q6_K}, {6144, 5120, GGML_TYPE_Q4_K},
+                     {5120, 6144, GGML_TYPE_Q4_K}, {12288, 5120, GGML_TYPE_Q4_K}, {1024, 5120, GGML_TYPE_Q4_K},
+                     {1024, 5120, GGML_TYPE_Q6_K}, {5120, 10240, GGML_TYPE_Q4_K}, {48, 5120, GGML_TYPE_Q4_K} }) {
+                test_cases.emplace_back(new test_mul_mat_prefill(t, nw, nc, kw));
+            }
+            // the GEMM alone on f16 weights (ceiling of the dequant + GEMM path)
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 17408, nc, 5120, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120, nc, 17408, { 1, 1 }, { 1, 1 }));
+            // attention: the ubatch over depth d + itself (n_kv padded to 256), f16 target KV, q8_0 MTP draft KV
+            for (int depth : { 0, 32768, 65536, 98304 }) {
+                const int kv = GGML_PAD(depth + nc, 256);
+                for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nc, true, false, 0, 0,
+                                            GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+                }
+            }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nc, 1, 3, false, false, 1));
+            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {5120, nc, 1, 1}, 1e-6f));
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {5120, nc, 1, 1}, false, 1e-6f));
+            test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {5120, nc, 1, 1}, {1, 1, 1, 1}));
+            test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {6144, nc, 1, 1}, {1, 1, 1, 1}));
+            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + nc, 10240, 1, 1}, {4, 10240, 1, 1}, false));
+            test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {17408, nc, 1, 1}, 0));
+            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, nc, 1}, 1e-6f, false));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1024, 131072, 1, 1 }, { 1, 1 }, nc, false));
+            // 8 chained GDN blocks / FFN blocks (whole-graph composites with their small ops)
+            test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 8));
+            test_cases.emplace_back(new test_ffn_chain(GGML_TYPE_Q4_K, 5120, 17408, nc, 8, 1));
+        }
+        return test_cases;
+    }
 
     // LOCAL (longdraft): one verify step of the house model (Qwen3.8-27B qwen35 Q4_K_M, q8_0 LM head) at 8..16 tokens,
     // every op shape it runs; env LONGDRAFT_ONLY=1 keeps just these (the rest of the perf list is skipped)

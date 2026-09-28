@@ -1,4 +1,6 @@
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -113,6 +115,35 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
 #endif
 }
 
+void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask_c) {
+    if (!mask_c || mask_c->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL || mask_c->op_params[3] != 1) {
+        return;
+    }
+    // test hook (negative control of the GGML_SYCL_FA_MASK_POISON test): PX_NO_ENSURE=1 skips the rebuild
+    static const bool no_ensure = getenv("PX_NO_ENSURE") != nullptr;
+    if (no_ensure) {
+        return;
+    }
+    ggml_tensor * mask = const_cast<ggml_tensor *>(mask_c);   // the flag lives in the host-side tensor struct
+    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    const int64_t n_used = mask->op_params[1];
+    const int64_t n_rows = mask->op_params[2];
+    const int64_t ne0 = mask->ne[0], ne1 = mask->ne[1], ne2 = mask->ne[2], ne3 = mask->ne[3];
+    const size_t  nb1 = mask->nb[1], nb2 = mask->nb[2], nb3 = mask->nb[3];
+    char * base = (char *) mask->data;
+    const int64_t n = ne0 * ne1 * ne2 * ne3;
+    const sycl::half zero = sycl::half(0.0f), ninf = sycl::half(-INFINITY);
+    ctx.stream()->parallel_for(sycl::range<1>(n), [=](sycl::id<1> ix) {
+        int64_t i = ix[0];
+        const int64_t i0 = i % ne0; i /= ne0;
+        const int64_t i1 = i % ne1; i /= ne1;
+        const int64_t i2 = i % ne2; const int64_t i3 = i / ne2;
+        const int64_t last = i1 < n_rows ? n_used - n_rows + i1 : -1;
+        *(sycl::half *) (base + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * sizeof(sycl::half)) = i0 <= last ? zero : ninf;
+    });
+    mask->op_params[3] = 2;
+}
+
 #if GGML_SYCL_DNNL
 
 #include "dnnl.hpp"
@@ -158,13 +189,47 @@ struct sdpa_partition {
     std::vector<logical_tensor> ins;
     logical_tensor              out;
     size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
+    // LOCAL (prefillx) implicit bottom-right causal mask: host-scalar inputs
+    size_t id_kvlen = SIZE_MAX, id_qlen = SIZE_MAX, id_ninf = SIZE_MAX;
     bool   ok = false;
 };
+
+// LOCAL (prefillx): GGML_SYCL_FA_CAUSAL=1 (default 0). When the KQ mask carries the GGML_KQ_MASK_HINT_CAUSAL hint
+// (llama sets it on a prefill ubatch whose mask is exactly bottom-right causal over the first n_used KV cells), the
+// SDPA runs with oneDNN's implicit bottom-right causal mask over K/V cut to n_used cells instead of adding the
+// explicit mask: no n_q x n_kv mask read per head, and the key loop of each query tile stops at the diagonal. The
+// same scores, max and exp terms as the explicit mask (a 0 added is exact, a -inf term contributes 0); only
+// oneDNN's kernel choice / tiling for the causal variant can change the summation order (rounding level).
+static bool ggml_sycl_fa_causal_env() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SYCL_FA_CAUSAL");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// n_used from the mask hint when the causal variant applies to this op, else 0
+static int64_t ggml_sycl_fa_causal_n_used(const ggml_tensor * mask, int64_t n_q, int64_t n_kv) {
+    if (!mask || !ggml_sycl_fa_causal_env()) {
+        return 0;
+    }
+    const int32_t * p = mask->op_params;
+    if (p[0] != GGML_KQ_MASK_HINT_CAUSAL) {
+        return 0;
+    }
+    const int64_t n_used = p[1];
+    const int64_t n_rows = p[2];
+    if (n_rows != n_q || mask->ne[1] < n_q || n_used < n_q || n_used > n_kv) {
+        return 0;
+    }
+    return n_used;
+}
 
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
 static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
-                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
+                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str,
+                                 bool causal = false) try {
     using ltype = logical_tensor::layout_type;
     using dt    = logical_tensor::data_type;
     using ldims = logical_tensor::dims;
@@ -193,11 +258,38 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     auto madd   = op(id++, op::kind::Add, "mask_add");
     madd.add_inputs({scaled, mask}); madd.add_outputs({masked});
 
+    // LOCAL (prefillx) implicit bottom-right causal mask (oneDNN's sdpa_bottom_right_causal_mask pattern):
+    // keep score[r][c] iff r + seq_len_kv - seq_len_q >= c, else -inf
+    using ptype = logical_tensor::property_type;
+    auto idx_row  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto gi_row   = op(id++, op::kind::GenIndex, "gen_index_row");
+    gi_row.set_attr<int64_t>(op::attr::axis, -2);
+    gi_row.add_inputs({scaled}); gi_row.add_outputs({idx_row});
+    auto kvlen    = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
+    auto r_add    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto cadd     = op(id++, op::kind::Add, "causal_add");
+    cadd.add_inputs({idx_row, kvlen}); cadd.add_outputs({r_add});
+    auto qlen     = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
+    auto r_sub    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto csub     = op(id++, op::kind::Subtract, "causal_sub");
+    csub.add_inputs({r_add, qlen}); csub.add_outputs({r_sub});
+    auto idx_col  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto gi_col   = op(id++, op::kind::GenIndex, "gen_index_col");
+    gi_col.set_attr<int64_t>(op::attr::axis, -1);
+    gi_col.add_inputs({scaled}); gi_col.add_outputs({idx_col});
+    auto keep     = logical_tensor(id++, dt::boolean, s_sz, ltype::strided);
+    auto cge      = op(id++, op::kind::GreaterEqual, "causal_ge");
+    cge.add_inputs({r_sub, idx_col}); cge.add_outputs({keep});
+    auto ninf     = logical_tensor(id++, fi, 0, ltype::strided, ptype::host_scalar);
+    auto cmasked  = logical_tensor(id++, fi, s_sz, ltype::strided);
+    auto csel     = op(id++, op::kind::Select, "causal_select");
+    csel.add_inputs({keep, scaled, ninf}); csel.add_outputs({cmasked});
+
     auto probs  = logical_tensor(id++, t,  s_sz, ltype::strided);
     auto smax   = op(id++, op::kind::SoftMax, "softmax");
     smax.set_attr<int64_t>(op::attr::axis, -1);
     smax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
-    smax.add_inputs({masked}); smax.add_outputs({probs});
+    smax.add_inputs({causal ? cmasked : masked}); smax.add_outputs({probs});
 
     auto value  = logical_tensor(id++, t,  kv_sz, v_st);
     // f16 output is REQUIRED to hit sdp_primitive_kernel_t (the systolic micro-kernel); an f32 output
@@ -208,12 +300,18 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     bmm2.add_inputs({probs, value}); bmm2.add_outputs({output});
 
     dnnl::graph::graph g(eng.get_kind());
-    g.add_op(bmm1); g.add_op(sdiv); g.add_op(madd); g.add_op(smax); g.add_op(bmm2);
+    g.add_op(bmm1); g.add_op(sdiv);
+    if (causal) {
+        g.add_op(gi_row); g.add_op(cadd); g.add_op(csub); g.add_op(gi_col); g.add_op(cge); g.add_op(csel);
+    } else {
+        g.add_op(madd);
+    }
+    g.add_op(smax); g.add_op(bmm2);
     g.finalize();
 
     auto parts = g.get_partitions();
     if (parts.size() != 1 || !parts[0].is_supported()) {
-        GGML_LOG_WARN("%s: oneDNN did not fuse the SDPA graph; falling back to TILE kernel\n", __func__);
+        GGML_LOG_WARN("%s: oneDNN did not fuse the SDPA graph%s; falling back\n", __func__, causal ? " (causal)" : "");
         return E;   // ok stays false -> caller falls back to TILE
     }
     E.ins      = parts[0].get_input_ports();
@@ -222,6 +320,10 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     E.out      = E.cp.query_logical_tensor(E.out.get_id());
     E.id_q     = query.get_id(); E.id_k = key.get_id(); E.id_v = value.get_id();
     E.id_scale = scale.get_id(); E.id_mask = mask.get_id();
+    if (causal) {
+        E.id_mask  = SIZE_MAX;
+        E.id_kvlen = kvlen.get_id(); E.id_qlen = qlen.get_id(); E.id_ninf = ninf.get_id();
+    }
     E.ok       = true;
     return E;
 }
@@ -399,16 +501,44 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
     static std::unordered_map<std::string, sdpa_partition> cache;
-    char keyb[256];
-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
-             (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
-             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
-    auto it = cache.find(keyb);
-    if (it == cache.end()) {
-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
+    auto get_partition = [&](int64_t n_seq, bool causal) -> sdpa_partition & {
+        char keyb[256];
+        snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%d", ggml_sycl_get_device(),
+                 (long long) H, (long long) Hkv, (long long) q, (long long) n_seq, (long long) d,
+                 (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
+                 (long long) v_str[0], (long long) v_str[1], (long long) v_str[3], (int) causal);
+        auto it = cache.find(keyb);
+        if (it == cache.end()) {
+            // LOCAL (prefillx) GGML_SYCL_FA_ONEDNN_LOG=1: host time of each partition build + compile
+            static const bool log_build = getenv("GGML_SYCL_FA_ONEDNN_LOG") != nullptr;
+            const auto t0 = std::chrono::steady_clock::now();
+            it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) n_seq, (int) d, k_str, v_str,
+                                                causal)).first;
+            if (log_build) {
+                GGML_LOG_INFO("%s: SDPA partition q=%lld seq=%lld causal=%d built in %.1f ms (ok=%d, %zu cached)\n",
+                              __func__, (long long) q, (long long) n_seq, (int) causal,
+                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                              (int) it->second.ok, cache.size());
+            }
+        }
+        return it->second;
+    };
+    // LOCAL (prefillx) GGML_SYCL_FA_CAUSAL: the implicit-causal partition over the first n_used cells (the K/V
+    // pointers and strides stay those of the n_kv-cell tensors; only the sequence dimension shrinks), else the
+    // explicit-mask partition over all n_kv cells
+    const int64_t n_used = ggml_sycl_fa_causal_n_used(mask, q, seq);
+    sdpa_partition * Ep = nullptr;
+    if (n_used > 0) {
+        sdpa_partition & Ec = get_partition(n_used, true);
+        if (Ec.ok) {
+            Ep = &Ec;
+        }
     }
-    sdpa_partition & E = it->second;
+    if (Ep == nullptr) {
+        ggml_sycl_fa_mask_ensure(ctx, mask);   // the explicit-mask partition reads the mask
+        Ep = &get_partition(seq, false);
+    }
+    sdpa_partition & E = *Ep;
     if (!E.ok) {
         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
         ggml_sycl_flash_attn_ext_tile(ctx, dst);
@@ -425,8 +555,20 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     };
     std::vector<tensor> ti;
     ti.reserve(E.ins.size());
+    int32_t kvlen_v = (int32_t) n_used;
+    int32_t qlen_v  = (int32_t) q;
+    float   ninf_v  = -INFINITY;
     for (auto & lt : E.ins) {
-        ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
+        const size_t lid = lt.get_id();
+        if (lid == E.id_kvlen) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
+        } else if (lid == E.id_qlen) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
+        } else if (lid == E.id_ninf) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
+        } else {
+            ti.emplace_back(lt, eng, id2ptr(lid));
+        }
     }
     tensor to(E.out, eng, outf_ptr);
     E.cp.execute(strm, ti, {to});
@@ -449,6 +591,7 @@ catch (const std::exception & e) {
     }
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
     GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
+    ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
     ggml_sycl_flash_attn_ext_tile(ctx, dst);
 }
 

@@ -317,6 +317,18 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
 
     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+    // LOCAL (prefillx) test hook GGML_SYCL_FA_MASK_POISON=1: NaN-fill a hinted, not-uploaded mask first, so any kernel
+    // reading it without regenerating it produces NaNs
+    static const bool poison = ggml_sycl_get_env("GGML_SYCL_FA_MASK_POISON", 0) != 0;
+    if (poison && dst->src[3] && dst->src[3]->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && dst->src[3]->op_params[3] == 1) {
+        const ggml_tensor * m = dst->src[3];
+        ctx.stream()->fill((sycl::half *) m->data, sycl::half(NAN), ggml_nbytes(m) / sizeof(sycl::half));
+    }
+    // LOCAL (prefillx): a hinted mask that was not uploaded is rebuilt on the device for every kernel that reads it
+    // (the oneDNN path decides for itself: its implicit-causal partition does not read the mask)
+    if (fk != BEST_FATTN_KERNEL_ONEDNN) {
+        ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
+    }
     switch (fk) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
