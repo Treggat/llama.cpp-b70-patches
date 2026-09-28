@@ -35,7 +35,24 @@ static bool ggml_sycl_xmx_q80_env() {
 }
 
 static constexpr int XMX_Q80_ROWS     = 16;
-static constexpr int XMX_Q80_MAX_COLS = 8;
+static constexpr int XMX_Q80_MAX_COLS = 8;    // the one-tile kernel
+static constexpr int XMX_Q80_WIDE_COLS = 16;  // LOCAL (longdraft): the two-tile kernel, 9..16 columns (opt-in)
+
+bool ggml_sycl_xmx_wide() {
+    // GGML_SYCL_XMX_WIDE=1 (LOCAL longdraft, default off): the XMX q6_K / q8_0 matmuls and the XMX flash attention take
+    // 9..16 columns (speculative verify batches of up to 16 tokens) instead of stopping at 8; 1..8 unchanged
+    static const bool v = ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_WIDE", 0) != 0;
+    return v;
+}
+
+bool ggml_sycl_xmx_direct_wide() {
+    // LOCAL (wideverify): with GGML_SYCL_XMX_WIDE=1, the register-fed q4_K / q6_K kernels (GGML_SYCL_XMX_Q4K_DIRECT /
+    // GGML_SYCL_XMX_Q6K_DIRECT) also serve 9..16 columns (two A tiles per staged B operand, bit-identical to the
+    // two-tile joint_matrix kernels at the same split-K). GGML_SYCL_XMX_DIRECT_WIDE=0 keeps 9..16 on the joint_matrix
+    // kernels (for A/B). Without WIDE this is always off.
+    static const bool v = ggml_sycl_xmx_wide() && ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_DIRECT_WIDE", 1) != 0;
+    return v;
+}
 static constexpr int XMX_Q80_SB       = 256;   // elements per staged super-block (2 parts x 4 groups)
 
 bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -54,7 +71,8 @@ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
         return false;
     }
     static const int min_cols = std::max(1, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MIN_COLS", 1));
-    static const int max_cols = std::min(XMX_Q80_MAX_COLS, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MAX_COLS", 8));
+    static const int max_cols = std::min(XMX_Q80_WIDE_COLS,
+                                         ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8));
     if (src1->ne[1] < min_cols || src1->ne[1] > max_cols) {
         return false;
     }
@@ -63,7 +81,7 @@ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
         return false;
     }
     static const size_t min_bytes = (size_t) std::max(0, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MIN_MB", 64)) << 20;
-    if (ggml_nbytes(src0) < min_bytes) {
+    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < min_bytes) {   // above 8 columns MMVQ is out of reach
         return false;
     }
     if (g_ggml_sycl_prioritize_dmmv || src0->extra == nullptr || src0->buffer == nullptr) {
@@ -221,6 +239,126 @@ sycl::event xmx_q80_launch(const int8_t * dQs, const uint16_t * dDd, const int8_
     });
 }
 
+// LOCAL (longdraft): the kernel above as a template on the column count, instantiated only for MC = 16 (two A tiles,
+// columns 0..7 and 8..15, on every staged B tile; xa [16][K], d8 [16][G]); per column the float operations and their
+// order are the one-tile kernel's. 1..8 columns keep the unmodified kernel above.
+template <int MC>
+sycl::event xmx_q80_launch_wide(const int8_t * dQs, const uint16_t * dDd, const int8_t * dXa, const sycl::half * dD8,
+                                float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
+    static_assert(MC == 16, "two A tiles");
+    constexpr int NT = MC / X8_TM;
+    const int KB = K / XMX_Q80_SB, G = K / QK8_0;
+    return q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<int8_t, 1> bslm(sycl::range<1>(ks * 16 * X8_PB), h);
+        sycl::local_accessor<float, 1>  red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * X8_SG), sycl::range<1>(ks * X8_SG)),
+                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(X8_SG)]] {
+            using sycl::access::address_space;
+            using sycl::access::decorated;
+            sycl::sub_group sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int s    = sg.get_group_id()[0];
+            const int row0 = (int) it.get_group(0) * 16;
+            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
+            auto bp = bslm.get_multi_ptr<decorated::no>() + s * 16 * X8_PB;
+
+            const int pp = lane % 8, rr = lane / 8;
+            const int8_t * gb = dQs + (size_t) (row0 + rr) * K + pp * 16;
+            const int so = rr * X8_PB + pp * 16;
+            const sycl::uint4 * hdw = reinterpret_cast<const sycl::uint4 *>(dDd + (size_t) (row0 + lane) * G);   // 8 halves / super-block
+            const sycl::uint4 * d8b = reinterpret_cast<const sycl::uint4 *>(dD8 + (size_t) lane * G);            // column lane
+
+            auto ldq = [](const int8_t * p) -> sycl::uint4 { return *reinterpret_cast<const sycl::uint4 *>(p); };
+            sycl::uint4 v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { v[j] = ldq(gb + (size_t) 2 * j * K + (size_t) b0 * XMX_Q80_SB); }
+            sycl::uint4 hw = hdw[b0], hc = d8b[b0];
+
+            float F[MC];
+#pragma unroll
+            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
+            for (int b = b0; b < b1; ++b) {
+                float dw[8], dc[8];   // this lane's row scales and column `lane`'s d8 for the 8 groups
+                {
+                    const uint32_t a[4] = { hw.x(), hw.y(), hw.z(), hw.w() };
+                    const uint32_t c[4] = { hc.x(), hc.y(), hc.z(), hc.w() };
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dw[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (a[j] & 0xFFFF));
+                        dw[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (a[j] >> 16));
+                        dc[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (c[j] & 0xFFFF));
+                        dc[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (c[j] >> 16));
+                    }
+                    const int bn = b + 1 < b1 ? b + 1 : b;   // next header (clamped, unconditional)
+                    hw = hdw[bn];
+                    hc = d8b[bn];
+                }
+#pragma unroll
+                for (int part = 0; part < 2; ++part) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        *reinterpret_cast<sycl::uint4 *>(&bp[so + 2 * j * X8_PB]) = v[j];
+                    }
+                    {   // prefetch the next part (clamped, unconditional)
+                        const int nb = part == 0 ? b : (b + 1 < b1 ? b + 1 : b);
+                        const int np = part == 0 ? 1 : (b + 1 < b1 ? 0 : 1);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            v[j] = ldq(gb + (size_t) 2 * j * K + (size_t) nb * XMX_Q80_SB + np * X8_PB);
+                        }
+                    }
+                    sycl::group_barrier(sg);
+#pragma unroll
+                    for (int gg = 0; gg < 4; ++gg) {
+                        const int g = part * 4 + gg;
+                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, X8_TK, X8_TN, mx::layout::col_major> B;
+                        mx::joint_matrix_load(sg, B, bp + gg * X8_TK, X8_PB);
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, X8_TM, X8_TK, mx::layout::row_major> A;
+                            mx::joint_matrix_load(sg, A,
+                                sycl::address_space_cast<address_space::global_space, decorated::no>(
+                                    dXa + (size_t) t * X8_TM * K + (size_t) b * XMX_Q80_SB + g * X8_TK), K);
+                            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, X8_TM, X8_TN> C;
+                            mx::joint_matrix_fill(sg, C, 0);
+                            mx::joint_matrix_mad(sg, C, A, B, C);
+                            float sb[8];
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) { sb[i] = dw[g] * sycl::select_from_group(sg, dc[g], t * 8 + i); }
+                            int i = 0;
+                            imx::joint_matrix_apply(sg, C, [&](int32_t & dot, size_t, size_t) {
+                                if (i < 8) { F[t * 8 + i] = sycl::fma((float) dot, sb[i], F[t * 8 + i]); }
+                                ++i;
+                            });
+                        }
+                    }
+                    sycl::group_barrier(sg);
+                }
+            }
+            if (ks > 1) {
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
+                sycl::group_barrier(it.get_group());
+                if (s == 0) {
+#pragma unroll
+                    for (int i = 0; i < MC; ++i) {
+                        float acc = red[i * 16 + lane];
+                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
+                        F[i] = acc;
+                    }
+                }
+            }
+            if (s == 0) {
+#pragma unroll
+                for (int i = 0; i < MC; ++i) {
+                    if (i < M) { dOut[(size_t) i * ldd + row0 + lane] = F[i]; }
+                }
+            }
+        });
+    });
+}
+
 int xmx_q80_pick_ks(int N, int K) {
     // 2 super-blocks per sub-group, at most 10 sub-groups per work-group. Measured on the B70 (test-backend-ops perf,
     // 248320 x 5120, us at 1 / 8 columns): ks 1 2498 / 2537, 2 - / 2369, 4 - / 2315, 5 2250 / 2308, 8 - / 2304,
@@ -246,7 +384,7 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
     const int64_t M = src1->ne[1];
     const int64_t G = K / QK8_1;
     GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == N && dst->ne[1] == M);
-    GGML_ASSERT(K % XMX_Q80_SB == 0 && N % XMX_Q80_ROWS == 0 && M >= 1 && M <= XMX_Q80_MAX_COLS);
+    GGML_ASSERT(K % XMX_Q80_SB == 0 && N % XMX_Q80_ROWS == 0 && M >= 1 && M <= XMX_Q80_WIDE_COLS);
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     GGML_ASSERT(extra && extra->optimized_feature.reorder);
 
@@ -256,6 +394,22 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
     const auto   d_off = q80_reordered::get_d_offset((int) N, (int) K, 0);
     const int8_t *   qs = reinterpret_cast<const int8_t *>(base);
     const uint16_t * dd = reinterpret_cast<const uint16_t *>(base + d_off.first);
+
+    if (M > XMX_Q80_MAX_COLS) {
+        // LOCAL (longdraft): 9..16 columns on the two-tile kernel
+        const size_t xa16 = (size_t) XMX_Q80_WIDE_COLS * K;
+        const size_t d816 = (size_t) XMX_Q80_WIDE_COLS * G * sizeof(sycl::half);
+        ggml_sycl_pool_alloc<char> act16(ctx.pool(), xa16 + d816);
+        int8_t *     xa = reinterpret_cast<int8_t *>(act16.get());
+        sycl::half * d8 = reinterpret_cast<sycl::half *>(act16.get() + xa16);
+        sycl::queue & q = *ctx.stream();
+        xmx_q80_quant_act(static_cast<const float *>(src1->data), xa, d8, (int) K, (int) M, q);
+        static const int ks16 = ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_KS16", 0);
+        const int ks = ks16 > 0 ? std::max(1, std::min(ks16, std::min(16, (int) (K / XMX_Q80_SB)))) : xmx_q80_pick_ks((int) N, (int) K);
+        xmx_q80_launch_wide<XMX_Q80_WIDE_COLS>(qs, dd, xa, d8, static_cast<float *>(dst->data), (int) N, (int) K, (int) M,
+                                               dst->ne[0], ks, q);
+        return;
+    }
 
     const size_t xa_bytes = (size_t) XMX_Q80_MAX_COLS * K;
     const size_t d8_bytes = (size_t) XMX_Q80_MAX_COLS * G * sizeof(sycl::half);
@@ -309,7 +463,7 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
     }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #else  // !GGML_SYCL_XMX

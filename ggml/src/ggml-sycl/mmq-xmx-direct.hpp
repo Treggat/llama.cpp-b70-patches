@@ -23,4 +23,15 @@ sycl::event ggml_sycl_xmx_q6k_direct_launch(const uint8_t * ql, const uint8_t * 
                                             const int8_t * xa, const sycl::half * d8, float * out, int N, int K, int M,
                                             int64_t ldd, int ks, sycl::queue & q);
 
+// LOCAL (wideverify): 9..16 columns (two A tiles on every register-built B operand). q4_K: the same operand layouts as
+// the 1..8 kernel (xa [G][16][32] already holds 16 columns). q6_K: xa [G][2][16][32] int8 (half-group tiles of 16
+// columns each), d8 [G][16] half. Per column the float operations and their order are the two-tile joint_matrix
+// kernels' (xmx_q4k_launch<16> / xmx_q6k_launch_wide<16>), so the outputs are bit-identical to them at the same ks.
+sycl::event ggml_sycl_xmx_q4k_direct16_launch(const uint8_t * qs, const uint8_t * sc, const uint32_t * dm, const int8_t * xa,
+                                              const sycl::half * d8, const int32_t * us, float * out, int N, int K, int M,
+                                              int64_t ldd, int ks, sycl::queue & q);
+sycl::event ggml_sycl_xmx_q6k_direct16_launch(const uint8_t * ql, const uint8_t * qh, const int8_t * sc, const uint16_t * dd,
+                                              const int8_t * xa, const sycl::half * d8, float * out, int N, int K, int M,
+                                              int64_t ldd, int ks, sycl::queue & q);
+
 #endif // GGML_SYCL_MMQ_XMX_DIRECT_HPP

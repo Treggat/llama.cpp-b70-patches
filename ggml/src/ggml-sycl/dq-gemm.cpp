@@ -240,5 +240,5 @@ void ggml_sycl_mul_mat_dq_gemm(ggml_backend_sycl_context & ctx, const ggml_tenso
 #endif
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }

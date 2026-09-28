@@ -4,6 +4,7 @@
 // Kernel: b70-secret-sauce/xmx-probe/xmx_fa.cpp, VAR 1 (NSG 8, TPS 8, GRF 256, QS 2 for R > 24), host harness removed.
 //
 #include "fattn-xmx.hpp"
+#include "mmq-xmx-q80.hpp"   // ggml_sycl_xmx_wide
 
 #include <algorithm>
 #include <atomic>
@@ -53,7 +54,7 @@ static int ggml_sycl_fattn_xmx_min_cols() {
 }
 
 static int ggml_sycl_fattn_xmx_max_cols() {
-    static const int v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_MAX_COLS", 8);
+    static const int v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8);
     return v;
 }
 
@@ -73,6 +74,32 @@ static int ggml_sycl_fattn_xmx_q8_min_cols() {
     // default 1: the q8_0 kernel beats TILE on q8_0 at 1 token too (TILE dequantizes the whole cache to f16 first)
     static const int v = std::max(1, ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_Q8_MIN_COLS", 1));
     return v;
+}
+
+// LOCAL (longdraft): query batches with more than XFA_MAXR rows (GQA ratio x tokens, e.g. 6 x 9..16 tokens) run as
+// qs query-row splits of at most XFA_MAXR rows each (the kernel's row -> (token, head) map is per row); the smallest
+// qs >= 2 that divides R, or GGML_SYCL_XMX_FA_QS_WIDE when it divides R into valid splits. 0 = no valid split, or
+// GGML_SYCL_XMX_WIDE off.
+static int ggml_sycl_fattn_xmx_wide_qs(int64_t R) {
+    if (!ggml_sycl_xmx_wide()) {   // opt-in: without it R > XFA_MAXR keeps declining, as before
+        return 0;
+    }
+    static const int qs_env = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_QS_WIDE", 0);
+    if (qs_env > 0 && R % qs_env == 0 && R / qs_env <= XFA_MAXR) {
+        return qs_env;
+    }
+    // prefer splits of <= GGML_SYCL_XMX_FA_WIDE_RW (default 32) rows: at kv 51200, 16 tokens x GQA 6 measured
+    // qs 2 (48 rows) 1025 us, qs 3 (32 rows) 709, qs 4 (24 rows) 804, qs 6 (16 rows) 885; 10 tokens: qs 2 (30 rows) 522,
+    // qs 3 630, qs 4 597 (the 5-6 accumulator-tile kernels, > 32 rows, run ~1.8x slower per row)
+    static const int rw_pref = std::max(8, std::min(XFA_MAXR, ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_WIDE_RW", 32)));
+    for (int lim : { rw_pref, XFA_MAXR }) {
+        for (int q = 2; q <= 8; ++q) {
+            if (R % q == 0 && R / q <= lim) {
+                return q;
+            }
+        }
+    }
+    return 0;
 }
 
 bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
@@ -123,7 +150,7 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
     if (K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != kv) {
         return false;
     }
-    if ((Q->ne[2] / K->ne[2]) * nb > XFA_MAXR) {
+    if ((Q->ne[2] / K->ne[2]) * nb > XFA_MAXR && ggml_sycl_fattn_xmx_wide_qs((Q->ne[2] / K->ne[2]) * nb) == 0) {
         return false;
     }
     // whole 64-token iterations only (llama.cpp pads the KV length to 256); no tail masking
@@ -800,7 +827,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     const int kv    = (int) K->ne[1];
     const int ratio = nh / nhkv;
     const int R     = nb * ratio;
-    GGML_ASSERT(R <= XFA_MAXR && kv % XFA_T == 0);
+    GGML_ASSERT(kv % XFA_T == 0);
+    const int qs_wide = R > XFA_MAXR ? ggml_sycl_fattn_xmx_wide_qs(R) : 0;   // LOCAL (longdraft): > 8 tokens
+    GGML_ASSERT(R <= XFA_MAXR || qs_wide > 0);
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -816,6 +845,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     int qs = v2 ? ((R > 30 && R % 2 == 0) ? 2 : 1) : ((R > 24 && nb % 2 == 0) ? 2 : 1);
     if (qs_env > 0 && (v2 ? R % qs_env : nb % qs_env) == 0 && (R / qs_env) <= XFA_MAXR) {
         qs = qs_env;
+    }
+    if (qs_wide > 0) {
+        qs = qs_wide;
     }
     const int Rw  = R / qs;
     const int R8p = (Rw + 7) / 8 * 8;   // rows per work-group, padded to the 8-row accumulator
@@ -889,7 +921,7 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
     xfa_dispatch(*ctx.stream(), p);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #else  // !GGML_SYCL_XMX

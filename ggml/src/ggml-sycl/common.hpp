@@ -160,6 +160,18 @@ extern bool g_ggml_sycl_graph_recording;
   GGML_ABORT("SYCL error");
 }
 
+// LOCAL (wideverify): the op-level `catch (sycl::exception ...)` handlers end with this instead of std::exit(1).
+// While a command graph is being recorded the exception is rethrown to the recorder (ggml_sycl_graph_record), which
+// drops the recording and runs that graph eagerly - e.g. a oneDNN GEMM inside a recording ("Graph nodes cannot depend
+// on events from outside the graph"); otherwise the process exits as before. Only valid inside a catch handler.
+#define GGML_SYCL_EXIT_OR_RETHROW()        \
+    do {                                   \
+        if (g_ggml_sycl_graph_recording) { \
+            throw;                         \
+        }                                  \
+        std::exit(1);                      \
+    } while (0)
+
 #define SYCL_CHECK(err)                                                                                    \
     do {                                                                                                   \
         auto err_ = (err);                                                                                 \

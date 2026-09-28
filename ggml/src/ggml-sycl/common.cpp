@@ -43,7 +43,7 @@ void* ggml_sycl_host_malloc(size_t size) try {
 } catch (sycl::exception const& exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 void ggml_sycl_host_free(void* ptr) try {
@@ -52,7 +52,7 @@ void ggml_sycl_host_free(void* ptr) try {
 } catch (sycl::exception const& exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 bool gpu_has_xmx(sycl::device &dev) {

@@ -682,10 +682,10 @@ void ggml_sycl_op_mul_mat_dnn_u4(ggml_backend_sycl_context & ctx, const ggml_ten
     if (sync_mask & 4) { stream->wait(); }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 } catch (const dnnl::error & e) {
     GGML_LOG_ERROR("%s: oneDNN error: %s\n", __func__, e.what());
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #else  // !GGML_SYCL_DNNL

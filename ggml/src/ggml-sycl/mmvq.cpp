@@ -3375,12 +3375,21 @@ static int ggml_sycl_smallrow_forced_ks() {
     return v;
 }
 
+// LOCAL (longdraft): the GDN alpha/beta fusion (the only caller of shape_ok) also takes 9..16 columns with
+// GGML_SYCL_XMX_WIDE=1 (or GGML_SYCL_SMALLROW_FUSE_MAX_COLS=9..16); without it those verify sizes ran the matmuls on
+// XMX (16 rows per sub-group: 3 tiles for 48 rows) plus the four epilogue ops unfused
+static int ggml_sycl_smallrow_fuse_max_cols() {
+    static const int v = std::max(1, std::min(16, ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_FUSE_MAX_COLS",
+                                                                          ggml_sycl_smallrow_env("GGML_SYCL_XMX_WIDE", 0) != 0 ? 16 : 8)));
+    return v;
+}
+
 bool ggml_sycl_smallrow_shape_ok(ggml_type type, int64_t nrows, int64_t ncols, int64_t ncols_dst) {
     if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) {
         return false;
     }
     return nrows >= 1 && nrows <= ggml_sycl_smallrow_max_rows(type) && ncols % QK_K == 0 && ncols_dst >= 1 &&
-           ncols_dst <= 8;
+           ncols_dst <= ggml_sycl_smallrow_fuse_max_cols();
 }
 
 bool ggml_sycl_smallrow_can_use(ggml_type type, int64_t nrows, int64_t ncols_dst) {
@@ -3543,6 +3552,16 @@ static bool mul_mat_vec_q_reorder_splitk_switch(const ggml_sycl_splitk_job & j0,
         case 6: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 6>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
         case 7: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 7>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
         case 8: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 8>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        // LOCAL (longdraft): 9..16 columns (GDN alpha/beta fusion at long verify batches; WARP_SIZE lanes hold the
+        // per-column results, so 16 is the limit)
+        case 9:  launch_mul_mat_vec_q_reorder_splitk<vec_dot, 9>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 10: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 10>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 11: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 11>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 12: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 12>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 13: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 13>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 14: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 14>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 15: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 15>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+        case 16: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 16>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
         default: return false;
     }
 }

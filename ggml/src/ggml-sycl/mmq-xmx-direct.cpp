@@ -19,6 +19,8 @@
 //
 #include "mmq-xmx-direct.hpp"
 
+#include <cstdlib>
+#include <type_traits>
 #include <utility>
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -30,6 +32,10 @@ namespace {
 
 typedef short xd_v8s16 __attribute__((ext_vector_type(8)));
 typedef int   xd_v8i32 __attribute__((ext_vector_type(8)));
+typedef short xd_v4s16 __attribute__((ext_vector_type(4)));   // LOCAL (wideverify): 4- / 2-row A / C (M = 4 / 2 DPAS)
+typedef int   xd_v4i32 __attribute__((ext_vector_type(4)));
+typedef short xd_v2s16 __attribute__((ext_vector_type(2)));
+typedef int   xd_v2i32 __attribute__((ext_vector_type(2)));
 
 }   // namespace
 
@@ -38,8 +44,15 @@ typedef int   xd_v8i32 __attribute__((ext_vector_type(8)));
 // Lane l holds A as short8 (row m, k = 2l..2l+1), B as int8 (column l, dword j = k 4j..4j+3) and C as int8 (column l,
 // element m = row m).
 SYCL_EXTERNAL xd_v8i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v8s16 a, xd_v8i32 b, xd_v8i32 acc);
+// the same extension's M = 4 form (rows 0..3 of A / C), LOCAL (wideverify)
+SYCL_EXTERNAL xd_v4i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v4s16 a, xd_v8i32 b, xd_v4i32 acc);
+SYCL_EXTERNAL xd_v2i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v2s16 a, xd_v8i32 b, xd_v2i32 acc);
+SYCL_EXTERNAL int      intel_sub_group_i8_i8_matrix_mad_k32(short a, xd_v8i32 b, int acc);
 #else
 static inline xd_v8i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v8s16, xd_v8i32 b, xd_v8i32) { return b; }
+static inline xd_v4i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v4s16, xd_v8i32, xd_v4i32 acc) { return acc; }
+static inline xd_v2i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v2s16, xd_v8i32, xd_v2i32 acc) { return acc; }
+static inline int      intel_sub_group_i8_i8_matrix_mad_k32(short, xd_v8i32, int acc) { return acc; }
 #endif
 
 namespace {
@@ -320,6 +333,349 @@ sycl::event ggml_sycl_xmx_q6k_direct_launch(const uint8_t * dQl, const uint8_t *
             if (s == 0) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) { if (i < M) { dOut[(size_t) i * ldd + row] = F[i]; } }
+            }
+        });
+    });
+}
+
+// ---- LOCAL (wideverify): 9..16 columns ----
+// q4_K: the 1..8 kernel with a second A tile (columns 8..15) on every register-built B operand. xa [G][16][32] already
+// holds 16 columns per group (tile t at +t*256 B), d8 / us are [16][G] (lane = column). Per column the float operations
+// and their order are those of the joint_matrix MC 16 kernel (xmx_q4k_launch<16>): per group, Fb[c] = fma(dot16,
+// rsd * d8, Fb[c]), Fb[c] = fma(d8 * sum(u), rw, Fb[c]); F[c] += Fb[c] per block; split-K reduced in SLM in sub-group
+// order. PRE: the block's 16 A tiles are loaded ahead of its DPAS chain (as the 1..8 kernel does) or per group.
+// T2: rows of the second A tile (8: columns 8..15; 4 / 2 / 1: columns 8..11 / 8..9 / 8 on the M = 4 / 2 / 1 DPAS)
+template <int T2> struct xd_tile2;
+template <> struct xd_tile2<8> { typedef xd_v8s16 a_t; typedef xd_v8i32 c_t; };
+template <> struct xd_tile2<4> { typedef xd_v4s16 a_t; typedef xd_v4i32 c_t; };
+template <> struct xd_tile2<2> { typedef xd_v2s16 a_t; typedef xd_v2i32 c_t; };
+template <> struct xd_tile2<1> { typedef short a_t; typedef int c_t; };
+template <typename T> static inline int xd_el(const T & v, int i) { return v[i]; }
+template <> inline int xd_el<int>(const int & v, int) { return v; }
+template <bool PRE, int T2>
+static sycl::event xd_q4k16(const uint8_t * dQs, const uint8_t * dSc, const uint32_t * dDm, const int8_t * dXa,
+                            const sycl::half * dD8c, const int32_t * dS8c, float * dOut, int N, int K, int M, int64_t ldd,
+                            int ks, sycl::queue & q) {
+    const int KB = K / QK_K, G = K / QK8_1;
+    return q.submit([&](sycl::handler & h) {
+        constexpr int MC = 8 + T2;
+        sycl::local_accessor<float, 1> red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * 16), sycl::range<1>(ks * 16)),
+                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            using sycl::access::address_space;
+            using sycl::access::decorated;
+            sycl::sub_group sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int s    = sg.get_group_id()[0];
+            const int row0 = (int) it.get_group(0) * 16;
+            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
+            const int row  = row0 + lane;
+            const uint8_t *  qrow = dQs + (size_t) row * (K / 2);
+            const uint32_t * hsc  = reinterpret_cast<const uint32_t *>(dSc + (size_t) row * KB * 12);
+            const uint32_t * hdm  = dDm + (size_t) row * KB;
+            const sycl::uint4 * d8base = reinterpret_cast<const sycl::uint4 *>(dD8c + (size_t) lane * G);
+            const sycl::int4 *  s8base = reinterpret_cast<const sycl::int4 *>(dS8c + (size_t) lane * G);
+            const uint16_t *    xa16   = reinterpret_cast<const uint16_t *>(dXa);
+
+            sycl::uint4 w[8], wn[8];
+            {
+                const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) b0 * 128);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w[j] = pp[j]; }
+            }
+            uint32_t hw0 = hsc[b0 * 3 + 0], hw1 = hsc[b0 * 3 + 1], hw2 = hsc[b0 * 3 + 2], hwd = hdm[b0];
+            float F[MC];
+#pragma unroll
+            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
+            for (int b = b0; b < b1; ++b) {
+                float rsd[8], rw[8];
+                {
+                    const uint32_t sc03 = hw0 & 0x3F3F3F3Fu, mn03 = hw1 & 0x3F3F3F3Fu;
+                    const uint32_t sc47 = (hw2 & 0x0F0F0F0Fu) | ((hw0 >> 2) & 0x30303030u);
+                    const uint32_t mn47 = ((hw2 >> 4) & 0x0F0F0F0Fu) | ((hw1 >> 2) & 0x30303030u);
+                    const float d    = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd & 0xFFFF));
+                    const float dmin = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd >> 16));
+                    const float d16  = d * 0.0625f, d8x = 8.f * d;
+#pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        const float sc = (float) (uint8_t) ((g < 4 ? sc03 : sc47) >> (8 * (g & 3)));
+                        const float mn = (float) (uint8_t) ((g < 4 ? mn03 : mn47) >> (8 * (g & 3)));
+                        rw[g]  = d8x * sc - dmin * mn;
+                        rsd[g] = d16 * sc;
+                    }
+                }
+                float d8c[8], tc[8];
+                {
+                    const sycl::uint4 dh = d8base[b];
+                    const sycl::int4  sa = s8base[b * 2], sb = s8base[b * 2 + 1];
+                    const uint32_t    dw[4] = { dh.x(), dh.y(), dh.z(), dh.w() };
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        d8c[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] & 0xFFFF));
+                        d8c[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] >> 16));
+                    }
+                    tc[0] = d8c[0] * (float) sa.x(); tc[1] = d8c[1] * (float) sa.y(); tc[2] = d8c[2] * (float) sa.z(); tc[3] = d8c[3] * (float) sa.w();
+                    tc[4] = d8c[4] * (float) sb.x(); tc[5] = d8c[5] * (float) sb.y(); tc[6] = d8c[6] * (float) sb.z(); tc[7] = d8c[7] * (float) sb.w();
+                }
+                {   // next block's header and nibbles (clamped, unconditional)
+                    const int bn = b + 1 < b1 ? b + 1 : b;
+                    hw0 = hsc[bn * 3 + 0]; hw1 = hsc[bn * 3 + 1]; hw2 = hsc[bn * 3 + 2]; hwd = hdm[bn];
+                    const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) bn * 128);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { wn[j] = pp[j]; }
+                }
+                auto lda = [&](int g, int t) -> xd_v8s16 {
+                    const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
+                        xa16 + (size_t) (b * 8 + g) * 256 + t * 128));
+                    xd_v8s16 a;
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) { a[m] = (short) av[m]; }
+                    return a;
+                };
+                using a2_t = typename xd_tile2<T2>::a_t;
+                using c2_t = typename xd_tile2<T2>::c_t;
+                auto lda2 = [&](int g) -> a2_t {   // the second tile's T2 rows (columns 8 .. 8 + T2 - 1)
+                    const uint16_t * p = xa16 + (size_t) (b * 8 + g) * 256 + 128;
+                    a2_t a;
+                    if constexpr (T2 == 1) {
+                        a = (short) p[lane];
+                    } else {
+                        const auto av = sg.load<T2>(sycl::address_space_cast<address_space::global_space, decorated::yes>(p));
+#pragma unroll
+                        for (int m = 0; m < T2; ++m) { a[m] = (short) av[m]; }
+                    }
+                    return a;
+                };
+                xd_v8s16 A[PRE ? 8 : 1];
+                a2_t     A2[PRE ? 8 : 1];
+                if constexpr (PRE) {
+#pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        A[g] = lda(g, 0);
+                        A2[g] = lda2(g);
+                    }
+                }
+                float Fb[MC];
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { Fb[i] = 0.f; }
+                xd_unroll(std::make_integer_sequence<int, 8>{}, [&](auto gi) {
+                    constexpr int g  = decltype(gi)::value;
+                    constexpr int ch = g >> 1;   // q4_K: group 2ch = low nibbles, 2ch+1 = high nibbles of qs[ch*32 ..]
+                    const sycl::uint4 w0 = w[2 * ch], w1 = w[2 * ch + 1];
+                    auto cv = [](uint32_t x) -> int {
+                        return (int) ((g & 1) ? ((x & 0xF0F0F0F0u) ^ 0x80808080u) : (((x << 4) & 0xF0F0F0F0u) ^ 0x80808080u));
+                    };
+                    const xd_v8i32 B = { cv(w0.x()), cv(w0.y()), cv(w0.z()), cv(w0.w()),
+                                         cv(w1.x()), cv(w1.y()), cv(w1.z()), cv(w1.w()) };
+                    auto epi = [&](auto acc, int t, auto nr) {
+                        constexpr int R = decltype(nr)::value;
+                        float sbv[R], tbv[R];
+#pragma unroll
+                        for (int i = 0; i < R; ++i) {
+                            sbv[i] = rsd[g] * sycl::select_from_group(sg, d8c[g], t * 8 + i);
+                            tbv[i] = sycl::select_from_group(sg, tc[g], t * 8 + i);
+                        }
+#pragma unroll
+                        for (int i = 0; i < R; ++i) {
+                            Fb[t * 8 + i] = sycl::fma((float) xd_el(acc, i), sbv[i], Fb[t * 8 + i]);
+                            Fb[t * 8 + i] = sycl::fma(tbv[i], rw[g], Fb[t * 8 + i]);
+                        }
+                    };
+                    {
+                        xd_v8s16 a;
+                        if constexpr (PRE) { a = A[g]; } else { a = lda(g, 0); }
+                        const xd_v8i32 z = 0;
+                        epi(intel_sub_group_i8_i8_matrix_mad_k32(a, B, z), 0, std::integral_constant<int, 8>{});
+                    }
+                    {
+                        a2_t a;
+                        if constexpr (PRE) { a = A2[g]; } else { a = lda2(g); }
+                        const c2_t z = 0;
+                        epi(intel_sub_group_i8_i8_matrix_mad_k32(a, B, z), 1, std::integral_constant<int, T2>{});
+                    }
+                });
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { F[i] += Fb[i]; }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w[j] = wn[j]; }
+            }
+            if (ks > 1) {   // split-K reduction in SLM, fixed order (the joint_matrix MC 16 kernel's)
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
+                sycl::group_barrier(it.get_group());
+                if (s == 0) {
+#pragma unroll
+                    for (int i = 0; i < MC; ++i) {
+                        float acc = red[i * 16 + lane];
+                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
+                        F[i] = acc;
+                    }
+                }
+            }
+            if (s == 0) {
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { if (i < M) { dOut[(size_t) i * ldd + row] = F[i]; } }
+            }
+        });
+    });
+}
+
+sycl::event ggml_sycl_xmx_q4k_direct16_launch(const uint8_t * dQs, const uint8_t * dSc, const uint32_t * dDm,
+                                              const int8_t * dXa, const sycl::half * dD8c, const int32_t * dS8c,
+                                              float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
+    // GGML_SYCL_XMX_DIRECT16_PRE=0: A tiles loaded per group instead of ahead of the block's DPAS chain
+    // GGML_SYCL_XMX_DIRECT16_M4=0: 9..12 columns also run the full 8-row second tile (default: the M = 1 / 2 / 4 DPAS
+    // for 9 / 10 / 11..12 columns)
+    static const bool pre = [] {
+        const char * e = getenv("GGML_SYCL_XMX_DIRECT16_PRE");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    static const bool m4 = [] {
+        const char * e = getenv("GGML_SYCL_XMX_DIRECT16_M4");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    if (m4 && M == 9) {
+        return pre ? xd_q4k16<true, 1>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
+                     xd_q4k16<false, 1>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
+    }
+    if (m4 && M == 10) {
+        return pre ? xd_q4k16<true, 2>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
+                     xd_q4k16<false, 2>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
+    }
+    if (m4 && M <= 12) {
+        return pre ? xd_q4k16<true, 4>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
+                     xd_q4k16<false, 4>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
+    }
+    return pre ? xd_q4k16<true, 8>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
+                 xd_q4k16<false, 8>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
+}
+
+// q6_K, 9..16 columns: xa [G][2 halves][16 columns][32] (half h of group g at g*1024 + h*512 B, column tile t at
+// +t*256 B), d8 [G][16] half (lane l's uint4 of block b = group l/2, columns 8(l%2)..+7: column 8t + i of group g is
+// component i of lane 2g + t). Per column the float operations and their order are xmx_q6k_launch_wide<16>'s:
+// lo = dot_lo * sc[2g]; Fb = fma(fma(dot_hi, sc[2g+1], lo), d8, Fb); F = fma(d/4, Fb, F).
+sycl::event ggml_sycl_xmx_q6k_direct16_launch(const uint8_t * dQl, const uint8_t * dQh, const int8_t * dSc,
+                                              const uint16_t * dD, const int8_t * dXa, const sycl::half * dD8,
+                                              float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
+    const int KB = K / QK_K;
+    return q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(ks > 1 ? ks * 16 * 16 : 1), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * 16), sycl::range<1>(ks * 16)),
+                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            using sycl::access::address_space;
+            using sycl::access::decorated;
+            sycl::sub_group sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int s    = sg.get_group_id()[0];
+            const int row0 = (int) it.get_group(0) * 16;
+            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
+            const int row  = row0 + lane;
+            const sycl::uint4 * gl   = reinterpret_cast<const sycl::uint4 *>(dQl + (size_t) row * KB * 128);
+            const sycl::uint4 * gh   = reinterpret_cast<const sycl::uint4 *>(dQh + (size_t) row * KB * 64);
+            const sycl::uint4 * hsc  = reinterpret_cast<const sycl::uint4 *>(dSc + (size_t) row * KB * 16);
+            const uint16_t *    hd   = dD + (size_t) row * KB;
+            const uint16_t *    xa16 = reinterpret_cast<const uint16_t *>(dXa);
+            const sycl::uint4 * d8base = reinterpret_cast<const sycl::uint4 *>(dD8) + lane;
+            auto d8f = [](uint32_t w, int hi) -> float {
+                return (float) sycl::bit_cast<sycl::half>((uint16_t) (hi ? (w >> 16) : (w & 0xFFFF)));
+            };
+
+            sycl::uint4 wl[8], wh[4], wln[8], whn[4];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { wl[j] = gl[(size_t) b0 * 8 + j]; }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { wh[j] = gh[(size_t) b0 * 4 + j]; }
+            sycl::uint4 hs  = hsc[b0];
+            uint16_t    hdd = hd[b0];
+            sycl::uint4 d8n = d8base[(size_t) b0 * 16];
+            float F[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) { F[i] = 0.f; }
+            for (int b = b0; b < b1; ++b) {
+                float scf[16];
+                {
+                    const uint32_t w[4] = { hs.x(), hs.y(), hs.z(), hs.w() };
+#pragma unroll
+                    for (int t = 0; t < 16; ++t) { scf[t] = (float) (int8_t) (w[t >> 2] >> (8 * (t & 3))); }
+                }
+                const float dq     = (float) sycl::bit_cast<sycl::half>(hdd) * 0.25f;   // exact
+                const float d8c[8] = { d8f(d8n.x(), 0), d8f(d8n.x(), 1), d8f(d8n.y(), 0), d8f(d8n.y(), 1),
+                                       d8f(d8n.z(), 0), d8f(d8n.z(), 1), d8f(d8n.w(), 0), d8f(d8n.w(), 1) };
+                {   // next block (clamped, unconditional)
+                    const int bn = b + 1 < b1 ? b + 1 : b;
+                    hs  = hsc[bn];
+                    hdd = hd[bn];
+                    d8n = d8base[(size_t) bn * 16];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { wln[j] = gl[(size_t) bn * 8 + j]; }
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { whn[j] = gh[(size_t) bn * 4 + j]; }
+                }
+                float Fb[16];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) { Fb[i] = 0.f; }
+                xd_unroll(std::make_integer_sequence<int, 8>{}, [&](auto gi) {
+                    constexpr int g = decltype(gi)::value;
+                    constexpr int hh = g >> 2, t4 = g & 3;
+                    const sycl::uint4 l0 = wl[4 * hh + 2 * (t4 & 1)], l1 = wl[4 * hh + 2 * (t4 & 1) + 1];
+                    const sycl::uint4 h0 = wh[2 * hh], h1 = wh[2 * hh + 1];
+                    const xd_v8i32 B = { (int) xd_q6k_stage<t4>(l0.x(), h0.x()), (int) xd_q6k_stage<t4>(l0.y(), h0.y()),
+                                         (int) xd_q6k_stage<t4>(l0.z(), h0.z()), (int) xd_q6k_stage<t4>(l0.w(), h0.w()),
+                                         (int) xd_q6k_stage<t4>(l1.x(), h1.x()), (int) xd_q6k_stage<t4>(l1.y(), h1.y()),
+                                         (int) xd_q6k_stage<t4>(l1.z(), h1.z()), (int) xd_q6k_stage<t4>(l1.w(), h1.w()) };
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+                        xd_v8s16 alo, ahi;
+                        {
+                            const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
+                                xa16 + (size_t) (b * 8 + g) * 512 + t * 128));
+#pragma unroll
+                            for (int m = 0; m < 8; ++m) { alo[m] = (short) av[m]; }
+                        }
+                        {
+                            const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
+                                xa16 + (size_t) (b * 8 + g) * 512 + 256 + t * 128));
+#pragma unroll
+                            for (int m = 0; m < 8; ++m) { ahi[m] = (short) av[m]; }
+                        }
+                        const xd_v8i32 z   = 0;
+                        const xd_v8i32 clo = intel_sub_group_i8_i8_matrix_mad_k32(alo, B, z);
+                        const xd_v8i32 chi = intel_sub_group_i8_i8_matrix_mad_k32(ahi, B, z);
+                        float db[8];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { db[i] = sycl::select_from_group(sg, d8c[i], 2 * g + t); }
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const float lo = (float) clo[i] * scf[2 * g];
+                            Fb[t * 8 + i] = sycl::fma(sycl::fma((float) chi[i], scf[2 * g + 1], lo), db[i], Fb[t * 8 + i]);
+                        }
+                    }
+                });
+#pragma unroll
+                for (int i = 0; i < 16; ++i) { F[i] = sycl::fma(dq, Fb[i], F[i]); }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { wl[j] = wln[j]; }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) { wh[j] = whn[j]; }
+            }
+            if (ks > 1) {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) { red[(s * 16 + i) * 16 + lane] = F[i]; }
+                sycl::group_barrier(it.get_group());
+                if (s == 0) {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        float acc = red[i * 16 + lane];
+                        for (int t = 1; t < ks; ++t) { acc += red[(t * 16 + i) * 16 + lane]; }
+                        F[i] = acc;
+                    }
+                }
+            }
+            if (s == 0) {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) { if (i < M) { dOut[(size_t) i * ldd + row] = F[i]; } }
             }
         });
     });

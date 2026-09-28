@@ -34,6 +34,8 @@
 #include <utility>
 #include <chrono>
 #include <map>
+#include <mutex>
+#include <set>
 #include <tuple>
 #include <cstring>
 #include <string>
@@ -475,6 +477,7 @@ static void ggml_check_sycl() try {
         }
         if (ggml_sycl_xmx_q4k_built()) {
             // same build switch; probes (and caches) the f16 matrix combination per device
+            GGML_LOG_INFO("  GGML_SYCL_XMX_WIDE: %d (XMX q6_K / q8_0 / FA at 9..16 columns)\n", (int) ggml_sycl_xmx_wide());
             GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (built, matrix f16:", (int) ggml_sycl_fattn_xmx_env());
             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count() && i < GGML_SYCL_MAX_DEVICES; ++i) {
                 GGML_LOG_INFO(" dev%u %s", i, ggml_sycl_fattn_xmx_device_ok((int) i) ? "YES" : "NO");
@@ -569,7 +572,7 @@ static void ggml_check_sycl() try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 /*
@@ -604,7 +607,7 @@ GGML_API void ggml_backend_sycl_get_gpu_list(int *id_list, int max_len) try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 inline void free_aligned_mem_host(void * memblock) {
@@ -666,7 +669,7 @@ ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void * ggml_backend_sycl_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -722,7 +725,7 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -750,7 +753,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -772,7 +775,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
@@ -891,7 +894,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     GGML_UNUSED(buffer);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
@@ -917,7 +920,7 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
@@ -1044,7 +1047,7 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -1242,7 +1245,7 @@ struct ggml_backend_sycl_split_buffer_context {
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
                 << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
+      GGML_SYCL_EXIT_OR_RETHROW();
     }
 
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
@@ -1335,7 +1338,7 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void
@@ -1391,7 +1394,7 @@ ggml_backend_sycl_split_buffer_set_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void
@@ -1447,7 +1450,7 @@ ggml_backend_sycl_split_buffer_get_tensor(ggml_backend_buffer_t buffer,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -2948,7 +2951,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *dst,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 inline void ggml_sycl_op_mul_mat_sycl(
@@ -2968,6 +2971,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
     GGML_ASSERT(ne00 == ne10);
 
     const int64_t row_diff = row_high - row_low;
+
+    // LOCAL (wideverify) test hook, GGML_SYCL_GRAPH_FAULT_INJECT=1: raise the error a oneDNN GEMM raises inside a
+    // recording ("Graph nodes cannot depend on events from outside the graph") on every recorded call of this path,
+    // so test-backend-ops can check that the recorder falls back to eager instead of the process exiting
+    static const bool fault_inject = ggml_sycl_get_env("GGML_SYCL_GRAPH_FAULT_INJECT", 0) != 0;
+    if (fault_inject && g_ggml_sycl_graph_recording) {
+        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                              "GGML_SYCL_GRAPH_FAULT_INJECT: simulated recording failure in ggml_sycl_op_mul_mat_sycl");
+    }
 
     int id;
     SYCL_CHECK(
@@ -3113,7 +3125,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
@@ -3502,7 +3514,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 } catch (sycl::exception const &exc) {
                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
                               << ", line:" << __LINE__ << std::endl;
-                    std::exit(1);
+                    GGML_SYCL_EXIT_OR_RETHROW();
                 }
             }
         }
@@ -3600,7 +3612,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                         } catch (const sycl::exception & exc) {
                             std::cerr << "Quantize_row_q8_1_sycl error" << exc.what()
                                       << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-                            std::exit(1);
+                            GGML_SYCL_EXIT_OR_RETHROW();
                         }
                     }
                 }
@@ -3673,7 +3685,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_sycl_repeat_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -3739,7 +3751,7 @@ static void ggml_sycl_mul_mat_vec_p021(ggml_backend_sycl_context & ctx, const gg
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_sycl_mul_mat_vec_nc(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -3780,7 +3792,7 @@ static void ggml_sycl_mul_mat_vec_nc(ggml_backend_sycl_context & ctx, const ggml
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void k_compute_batched_ptrs(const sycl::half * src0_as_f16, const sycl::half * src1_as_f16, void * dst,
@@ -4054,7 +4066,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 enum class mul_mat_algo {
@@ -4771,6 +4783,26 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 }
 
+// LOCAL (longdraft): the reorder for a q6_K / q8_0 weight that an XMX path serves at 9..16 columns. The normal
+// bootstrap (opt_for_reorder -> should_reorder_tensor) stops at 8 columns; this installs the same layout (a no-op once
+// done). Only called for ne[1] > 8, so the 1..8-column dispatch is untouched.
+static void opt_for_reorder_wide(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
+    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+        return;
+    }
+    if (src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0) {
+        return;
+    }
+    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra || extra->optimized_feature.reorder) {
+        return;
+    }
+    if (reorder_qw(src0, ctx->stream())) {
+        extra->optimized_feature.reorder = true;
+        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
+    }
+}
+
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
@@ -4907,7 +4939,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // LOCAL: q8_0 x 2..8 columns on the XMX matrix units (mmq-xmx-q80.cpp), for the big q8_0 LM head at verify column
     // counts: MMVQ reorder layout read in place. Default off (GGML_SYCL_XMX_Q80=1); weights under 64 MB stay on MMVQ.
     if (!split && !smallrow && ggml_sycl_xmx_q80_can_use(ctx, src0, src1, dst)) {
-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        if (src1->ne[1] > 8) {
+            opt_for_reorder_wide(&ctx, src0);   // LOCAL (longdraft)
+        } else {
+            opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        }
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             ggml_sycl_mul_mat_xmx_q80(ctx, src0, src1, dst);
@@ -4919,7 +4955,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // read in place, the same SoA q8_1 activations); small weights stay on MMVQ (can_use's minimum-work guards).
     // Default off (GGML_SYCL_XMX_Q6K=1).
     if (!split && !smallrow && ggml_sycl_xmx_q6k_can_use(ctx, src0, src1, dst)) {
-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        if (src1->ne[1] > 8) {
+            opt_for_reorder_wide(&ctx, src0);   // LOCAL (longdraft)
+        } else {
+            opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        }
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             if (ggml_sycl_xmx_q6k_path() == 1) {
@@ -4984,6 +5024,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
+        // LOCAL (wideverify): GGML_SYCL_LOG_GEMM_FALLBACK=1 names every weight / column count that reaches the
+        // dequantize + oneDNN/MKL GEMM path (once each; with GGML_SYCL_ENABLE_GRAPH=1 such a graph cannot be recorded)
+        static const bool log_fb = ggml_sycl_get_env("GGML_SYCL_LOG_GEMM_FALLBACK", 0) != 0;
+        if (log_fb) {
+            static std::mutex mu;
+            static std::set<std::string> seen;
+            char key[256];
+            snprintf(key, sizeof(key), "%s %s %lldx%lld cols %lld", src0->name, ggml_type_name(src0->type),
+                     (long long) src0->ne[1], (long long) src0->ne[0], (long long) src1->ne[1]);
+            std::lock_guard<std::mutex> lk(mu);
+            if (seen.insert(key).second) {
+                GGML_LOG_WARN("[SYCL] mul_mat GEMM fallback: %s%s\n", key, g_ggml_sycl_graph_recording ? " (recording)" : "");
+            }
+        }
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }
 }
@@ -5493,7 +5547,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -5585,7 +5639,7 @@ static void ggml_sycl_set_main_device(const int main_device) try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
@@ -5975,7 +6029,7 @@ GGML_API void ggml_backend_sycl_get_device_description(int device, char *descrip
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 bool sycl_get_mem_info(int device, size_t * free, size_t * total) {
@@ -6004,7 +6058,7 @@ void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * tot
     ggml_sycl_memtrace_report_device("device memory query", device, *free, *total);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -6043,7 +6097,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
@@ -6064,7 +6118,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
@@ -6094,7 +6148,7 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
@@ -6108,7 +6162,7 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
@@ -7562,7 +7616,7 @@ catch (sycl::exception const &exc)
 {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__
               << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) try {
@@ -7576,7 +7630,7 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 } catch (sycl::exception const& exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__
               << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static ggml_backend_i ggml_backend_sycl_interface = {
@@ -8176,7 +8230,7 @@ static void ggml_backend_sycl_device_event_free(ggml_backend_dev_t dev, ggml_bac
 } catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 
@@ -8189,7 +8243,7 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
 } catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+  GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 static const ggml_backend_device_i ggml_backend_sycl_device_interface = {

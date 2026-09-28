@@ -10243,6 +10243,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, nc, 5120, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nc, 5152, { 1, 1 }, { 1, 1 }));
     }
+    // LOCAL (longdraft): the SYCL XMX q6_K / q8_0 two-tile kernels at 9..16 columns (GGML_SYCL_XMX_WIDE=1; q8_0 small
+    // shapes need GGML_SYCL_XMX_Q80_MIN_MB=0): house shapes, the small-row weights (no split-K MMVQ above 8 columns),
+    // a single 256-block K and K = 11*256
+    for (int nc : { 9, 10, 11, 12, 13, 15, 16 }) {
+        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {5120, 17408}, {10240, 5120}, {1024, 5120}, {48, 5120}, {32, 256}, {64, 2816} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {4096, 5120}, {1024, 256}, {64, 2816}, {48, 5120} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int nc : { 12, 16 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
+    }
+    // LOCAL (wideverify): the SYCL register-fed q4_K kernel at 9..16 columns (GGML_SYCL_XMX_Q4K_DIRECT=1 +
+    // GGML_SYCL_XMX_WIDE=1): every house q4_K shape (incl. the MTP eh_proj and the 98304-row draft head), a single
+    // 256-block K, K = 11*256, and the small-row weights that take XMX above 8 columns
+    for (int nc : { 9, 10, 11, 13, 14, 15, 16 }) {
+        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144},
+                                                               {12288, 5120}, {1024, 5120}, {5120, 10240}, {48, 5120},
+                                                               {32, 256}, {64, 2816} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (int nc : { 9, 16 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 98304, nc, 5120, { 1, 1 }, { 1, 1 }));
+    }
+    // LOCAL (wideverify): 9..16-column mul_mats that fall to dequantize + oneDNN GEMM on SYCL (no XMX / MMVQ path):
+    // with GGML_SYCL_ENABLE_GRAPH=1 + GGML_SYCL_GRAPH_RECORD_AHEAD=1 (or GGML_SYCL_GRAPH_SELFTEST=1) and
+    // GGML_SYCL_GRAPH_MAX_TOKENS >= 12 their graph is recorded; the recording must fail over to eager, not exit
+    for (int nc : { 9, 12 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 4096, nc, 5120, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, nc, 5120, { 1, 1 }, { 1, 1 }));
+    }
     // LOCAL (not for upstream): SYCL XMX q4_K / q6_K edge shapes. K = 11*256 pads the q8_1 row to 3072 with the ds
     // values at the unpadded K; 4100 rows is not a multiple of the 16-row tile, so XMX must decline and MMVQ serve it.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
@@ -10263,7 +10297,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // LOCAL (not for upstream): qwen35 gated-delta layer chains (SYCL GDN fusions)
     for (ggml_type type_w : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
-        for (int nc : { 1, 2, 3, 6, 8 }) {
+        for (int nc : { 1, 2, 3, 6, 8, 9, 12, 16 }) {   // LOCAL (longdraft): 9..16 (GGML_SYCL_XMX_WIDE)
             test_cases.emplace_back(new test_gdn_chain(type_w, 5120, nc, 1));
         }
         // (no multi-layer eval case: the residual chain amplifies the q8_1-vs-CPU activation quantization gap past
@@ -11151,6 +11185,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int nb : { 1, 4, 8, }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     }
+    // LOCAL (wideverify): the q8_0 XMX kernel with the wide query-row splits (GGML_SYCL_XMX_WIDE=1): the MTP catch-up
+    // over a q8_0 draft KV cache at 9..16 tokens, a partial last chunk + KV view, a deep cache, a 1-chunk cache
+    for (int nb : { 10, 11, 13, 14, 15, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    }
+    for (int nb : { 9, 12, 16, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    }
+    // LOCAL (longdraft): SYCL XMX FA above 48 query rows per KV head (GGML_SYCL_XMX_WIDE=1: 9..16 tokens x GQA 6 as
+    // query-row splits), a partial last chunk + KV view, and GQA 8 / 16 row counts that need 2 / 3 splits
+    for (int nb : { 9, 10, 11, 12, 13, 14, 15, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 9,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 9,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -11524,6 +11577,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // LOCAL (longdraft): one verify step of the house model (Qwen3.8-27B qwen35 Q4_K_M, q8_0 LM head) at 8..16 tokens,
+    // every op shape it runs; env LONGDRAFT_ONLY=1 keeps just these (the rest of the perf list is skipped)
+    {
+        for (int nc : { 8, 9, 10, 12, 14, 16 }) {
+            for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
+                                                                   {12288, 5120}, {5120, 6144}, {1024, 5120}, {48, 5120} }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            }
+            for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {10240, 5120}, {5120, 17408}, {1024, 5120} }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+            }
+            // LM head: 1/10 of it (24832 rows) always - the unextended path dequantizes the whole weight to f16 (2.5 GB
+            // for the full head); the full 248320 rows as a separate case (run it only where the XMX path serves it)
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24832, nc, 5120, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 51200, nc, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            // LOCAL (wideverify): the MTP catch-up attention over a q8_0 draft KV cache, and the MTP eh_proj
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 51200, nc, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, nc, 10240, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_gdn_gather(48, 128, nc, nc - 1, 1, 3));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nc, 1, 3, false, false, nc - 1));
+            test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 1));
+            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {5120, nc, 1, 1}, 1e-6f));
+            test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {5120, nc, 1, 1}, {1, 1, 1, 1}));
+            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + nc, 10240, 1, 1}, {4, 10240, 1, 1}, false));
+            test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {17408, nc, 1, 1}, 0));
+            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, nc, 1}, 1e-6f, false));
+        }
+    }
+    if (getenv("LONGDRAFT_ONLY")) {
+        return test_cases;
+    }
 
     // [step-prof] house model: q8_0 LM head (248320), q8_0 MTP draft head (98304), q8_0 MTP layer shapes,
     // GDN (16 k-heads x3 v-repeat, d128, K rollback slots), ssm_conv, rms_norm, top-k over the padded vocab

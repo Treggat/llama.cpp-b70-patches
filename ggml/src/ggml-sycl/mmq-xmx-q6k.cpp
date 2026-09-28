@@ -7,6 +7,7 @@
 #include "mmq-xmx-q6k.hpp"
 #include "mmq-xmx-q4k.hpp"
 #include "mmq-xmx-direct.hpp"
+#include "mmq-xmx-q80.hpp"
 #include "quants.hpp"
 #include "quantize.hpp"
 
@@ -39,9 +40,11 @@ bool ggml_sycl_xmx_q6k_direct_env() {
     return v;
 }
 
-// kernel tile: 16 weight rows per sub-group, up to 8 activation columns (the A tile's M)
+// kernel tile: 16 weight rows per sub-group, up to 8 activation columns (the A tile's M); LOCAL (longdraft): a second
+// kernel instance runs two A tiles (9..16 columns) against every staged B tile, opt-in (GGML_SYCL_XMX_WIDE=1 or
+// GGML_SYCL_XMX_Q6K_MAX_COLS=9..16); 1..8 columns keep the one-tile kernel unchanged
 static constexpr int XMX_Q6K_ROWS     = 16;
-static constexpr int XMX_Q6K_MAX_COLS = 8;
+static constexpr int XMX_Q6K_MAX_COLS = 16;
 
 static int ggml_sycl_xmx_q6k_min_cols() {
     // direct kernel (GGML_SYCL_XMX_Q6K_DIRECT=1): 2, for weights of at least BIG_MB only (see can_use)
@@ -51,7 +54,9 @@ static int ggml_sycl_xmx_q6k_min_cols() {
 }
 
 static int ggml_sycl_xmx_q6k_max_cols() {
-    static const int v = std::min(XMX_Q6K_MAX_COLS, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MAX_COLS", 8));
+    // the legacy driver path (GGML_SYCL_XMX_Q6K_PATH=1) only has the one-tile kernel
+    static const int v = std::min(ggml_sycl_xmx_q6k_path() == 0 ? XMX_Q6K_MAX_COLS : 8,
+                                  ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8));
     return v;
 }
 
@@ -105,11 +110,14 @@ bool ggml_sycl_xmx_q6k_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
         dst->ne[0] != src0->ne[1] || ggml_nbytes(src0) >= (size_t) INT_MAX) {   // reorder offset helpers use int
         return false;
     }
-    // minimum work (see the guards above): small weights, and mid-size weights at few columns, are faster on MMVQ
-    if (ggml_nbytes(src0) < ggml_sycl_xmx_q6k_min_bytes()) {
+    // minimum work (see the guards above): small weights, and mid-size weights at few columns, are faster on MMVQ.
+    // Above 8 columns MMVQ is out of reach (MMVQ_MAX_BATCH_SIZE) and the alternative is dequantize + f16 GEMM, so the
+    // guards only apply up to 8 columns.
+    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < ggml_sycl_xmx_q6k_min_bytes()) {
         return false;
     }
-    if (ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes() && src1->ne[1] < ggml_sycl_xmx_q6k_small_min_cols()) {
+    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes() &&
+        src1->ne[1] < ggml_sycl_xmx_q6k_small_min_cols()) {
         return false;
     }
     // direct kernel at 2 columns: only weights of at least BIG_MB (5120x17408 ffn_down: MMVQ 152.0 vs direct 140.9 us)
@@ -139,7 +147,7 @@ namespace imx = sycl::ext::intel::experimental::matrix;
 namespace {
 
 constexpr int X6_TM = 8, X6_TN = 16, X6_TK = 32, X6_SG = 16;
-constexpr int X6_MC = XMX_Q6K_MAX_COLS;   // columns the kernel is specialised for
+constexpr int X6_MC = 8;                  // columns of the one-tile kernel (MC = 16: two A tiles)
 constexpr int X6_PB = 128;                // SLM bytes per row per staged part (half a block)
 
 // Activation pack from the driver's SoA q8_1 buffer (quantize_and_reorder_q8_1_soa): column c starts at
@@ -184,6 +192,9 @@ void xmx_q6k_pack_act(const char * y, size_t stride_y, int8_t * xa, sycl::half *
 // Columns >= M are left unwritten: they only feed accumulator rows the kernel never stores (integer DPAS, per-row).
 // gmajor: xa in the direct kernel's group-major layout [G][2 tiles][8 columns][32]: tile 0 = elements 0..15 then 16
 // zeros, tile 1 = 16 zeros then elements 16..31 (the same two A tiles, 512 B per group, one block read each)
+// DC: columns per d8 row (8 for the one-tile kernel; 16 for the two-tile kernel, LOCAL longdraft). With DC = 16 the
+// group-major layout is [G][2][16][32] (LOCAL wideverify, the 9..16-column register-fed kernel); DC = 8 is unchanged.
+template <int DC = X6_TM>
 sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int K, int M, sycl::queue & q,
                               bool gmajor = false) {
     constexpr int EPW = QK8_1 / WARP_SIZE;
@@ -201,9 +212,9 @@ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
         const int    lane = (int) it.get_local_id(0);
         const int    e    = lane * EPW;        // this lane's first element of the group
         if (gmajor) {
-            int8_t * dst = xa + (size_t) g * 512 + (size_t) c * 32;
-            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 0 : 256) + e) = qv;
-            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 256 : 0) + e) = sycl::vec<int8_t, EPW>(0);
+            int8_t * dst = xa + (size_t) g * (DC * 64) + (size_t) c * 32;
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 0 : DC * 32) + e) = qv;
+            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? DC * 32 : 0) + e) = sycl::vec<int8_t, EPW>(0);
         } else {
             int8_t * dst = xa + (size_t) c * 2 * K + (size_t) g * 64;
             // elements 0..15 at +0, 16..31 at +48; bytes 16..47 zero (EPW per lane covers 32 bytes over the sub-group)
@@ -211,7 +222,7 @@ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
             *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + 16 + e) = sycl::vec<int8_t, EPW>(0);
         }
         if (lane == 0) {
-            d8[(size_t) g * X6_TM + c] = sycl::half(d);
+            d8[(size_t) g * DC + c] = sycl::half(d);
         }
     });
 }
@@ -441,6 +452,193 @@ sycl::event xmx_q6k_launch(const uint8_t * dQl, const uint8_t * dQh, const int8_
     });
 }
 
+// LOCAL (longdraft): the kernel above as a template on the column count; instantiated only for MC = 16 (9..16
+// columns), so the 1..8-column kernel stays the unmodified one-tile code
+template <int MC>
+sycl::event xmx_q6k_launch_wide(const uint8_t * dQl, const uint8_t * dQh, const int8_t * dSc, const uint16_t * dD,
+                           const int8_t * dXa, const sycl::half * dD8, float * dOut, int N, int K, int M, int64_t ldd,
+                           int ks, sycl::queue & q) {
+    // MC = 8: one A tile (columns 0..7), d8 [G][8]. MC = 16 (LOCAL longdraft): two A tiles (columns 0..7, 8..15) on
+    // every staged B tile, xa [16][2K], d8 [G][16]; per column the float operations and their order are the MC = 8
+    // kernel's.
+    static_assert(MC == 8 || MC == 16, "one or two A tiles");
+    constexpr int NT = MC / X6_TM;
+    const int KB = K / QK_K;
+    return q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<int8_t, 1> bslm(sycl::range<1>(ks * 16 * X6_PB), h);
+        sycl::local_accessor<float, 1>  red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * X6_SG), sycl::range<1>(ks * X6_SG)),
+                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(X6_SG)]] {
+            using sycl::access::address_space;
+            using sycl::access::decorated;
+            sycl::sub_group sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int s    = sg.get_group_id()[0];
+            const int row0 = (int) it.get_group(0) * 16;
+            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
+            auto bp = bslm.get_multi_ptr<decorated::no>() + s * 16 * X6_PB;
+
+            const int j  = lane & 1;
+            const int ra = lane >> 1;                   // unit 0 row; unit 1 row = ra + 8
+            const uint8_t * gl = dQl + (size_t) (row0 + ra) * KB * 128 + j * 16;
+            const uint8_t * gh = dQh + (size_t) (row0 + ra) * KB * 64 + j * 16;
+            const size_t    rl = (size_t) 8 * KB * 128, rh = (size_t) 8 * KB * 64;   // +8 rows
+            const int       so = ra * X6_PB + j * 16;
+            const sycl::uint4 * hsc = reinterpret_cast<const sycl::uint4 *>(dSc + (size_t) (row0 + lane) * KB * 16);
+            const uint16_t *    hd  = dD + (size_t) (row0 + lane) * KB;
+            const int8_t *      xa  = dXa;
+            // MC 8:  d8 [G][8] half: lane l's 4 halves (one uint2) of block b = group l/2, columns 4(l%2)..+3; column i
+            //        of group g is component i%4 of lane 2g + i/4
+            // MC 16: d8 [G][16] half: lane l's 8 halves (one uint4) = group l/2, columns 8(l%2)..+7; column 8t + i of
+            //        group g is component i of lane 2g + t
+            using d8v_t = std::conditional_t<MC == 8, sycl::uint2, sycl::uint4>;
+            constexpr int ND8 = MC == 8 ? 4 : 8;
+            const d8v_t * d8base = reinterpret_cast<const d8v_t *>(dD8) + lane;
+            auto d8f = [](uint32_t w, int hi) -> float {
+                return (float) sycl::bit_cast<sycl::half>((uint16_t) (hi ? (w >> 16) : (w & 0xFFFF)));
+            };
+
+            auto ldq = [](const uint8_t * p) -> sycl::uint4 { return *reinterpret_cast<const sycl::uint4 *>(p); };
+            sycl::uint4 va[2], vb[2], vh[2];            // next part: ql run a, ql run b, qh, per unit
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                va[u] = ldq(gl + u * rl + b0 * 128);
+                vb[u] = ldq(gl + u * rl + b0 * 128 + 32);
+                vh[u] = ldq(gh + u * rh + b0 * 64);
+            }
+            sycl::uint4  hs  = hsc[b0];
+            uint16_t     hdd = hd[b0];
+            d8v_t        d8n = d8base[(size_t) b0 * 16];
+
+            float F[MC];
+            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
+            for (int b = b0; b < b1; ++b) {
+                float scf[16];
+                {
+                    const uint32_t w[4] = { hs.x(), hs.y(), hs.z(), hs.w() };
+#pragma unroll
+                    for (int t = 0; t < 16; ++t) { scf[t] = (float) (int8_t) (w[t >> 2] >> (8 * (t & 3))); }
+                }
+                const float dq = (float) sycl::bit_cast<sycl::half>(hdd) * 0.25f;   // exact
+                float d8c[ND8];
+                if constexpr (MC == 8) {
+                    d8c[0] = d8f(d8n.x(), 0); d8c[1] = d8f(d8n.x(), 1); d8c[2] = d8f(d8n.y(), 0); d8c[3] = d8f(d8n.y(), 1);
+                } else {
+                    d8c[0] = d8f(d8n.x(), 0); d8c[1] = d8f(d8n.x(), 1); d8c[2] = d8f(d8n.y(), 0); d8c[3] = d8f(d8n.y(), 1);
+                    d8c[4] = d8f(d8n.z(), 0); d8c[5] = d8f(d8n.z(), 1); d8c[6] = d8f(d8n.w(), 0); d8c[7] = d8f(d8n.w(), 1);
+                }
+                {   // next block's header (clamped, unconditional)
+                    const int bn = b + 1 < b1 ? b + 1 : b;
+                    hs  = hsc[bn];
+                    hdd = hd[bn];
+                    d8n = d8base[(size_t) bn * 16];
+                }
+                float Fb[MC];
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { Fb[i] = 0.f; }
+#pragma unroll
+                for (int part = 0; part < 2; ++part) {
+#pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        sycl::uint4 o0, o1, o2, o3;
+                        o0.x() = xmx_q6k_stage<0>(va[u].x(), vh[u].x()); o0.y() = xmx_q6k_stage<0>(va[u].y(), vh[u].y());
+                        o0.z() = xmx_q6k_stage<0>(va[u].z(), vh[u].z()); o0.w() = xmx_q6k_stage<0>(va[u].w(), vh[u].w());
+                        o1.x() = xmx_q6k_stage<1>(vb[u].x(), vh[u].x()); o1.y() = xmx_q6k_stage<1>(vb[u].y(), vh[u].y());
+                        o1.z() = xmx_q6k_stage<1>(vb[u].z(), vh[u].z()); o1.w() = xmx_q6k_stage<1>(vb[u].w(), vh[u].w());
+                        o2.x() = xmx_q6k_stage<2>(va[u].x(), vh[u].x()); o2.y() = xmx_q6k_stage<2>(va[u].y(), vh[u].y());
+                        o2.z() = xmx_q6k_stage<2>(va[u].z(), vh[u].z()); o2.w() = xmx_q6k_stage<2>(va[u].w(), vh[u].w());
+                        o3.x() = xmx_q6k_stage<3>(vb[u].x(), vh[u].x()); o3.y() = xmx_q6k_stage<3>(vb[u].y(), vh[u].y());
+                        o3.z() = xmx_q6k_stage<3>(vb[u].z(), vh[u].z()); o3.w() = xmx_q6k_stage<3>(vb[u].w(), vh[u].w());
+                        const int o = so + u * 8 * X6_PB;
+                        *reinterpret_cast<sycl::uint4 *>(&bp[o])      = o0;
+                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 32]) = o1;
+                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 64]) = o2;
+                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 96]) = o3;
+                    }
+                    {   // prefetch the next part (clamped, unconditional: no phi copies)
+                        const int nb = part + 1 < 2 ? b : (b + 1 < b1 ? b + 1 : b);
+                        const int np = part + 1 < 2 ? part + 1 : (b + 1 < b1 ? 0 : part);
+#pragma unroll
+                        for (int u = 0; u < 2; ++u) {
+                            va[u] = ldq(gl + u * rl + nb * 128 + np * 64);
+                            vb[u] = ldq(gl + u * rl + nb * 128 + np * 64 + 32);
+                            vh[u] = ldq(gh + u * rh + nb * 64 + np * 32);
+                        }
+                    }
+                    sycl::group_barrier(sg);
+#pragma unroll
+                    for (int gg = 0; gg < 4; ++gg) {
+                        const int g = part * 4 + gg;
+                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, X6_TK, X6_TN, mx::layout::col_major> B;
+                        mx::joint_matrix_load(sg, B, bp + gg * X6_TK, X6_PB);
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, X6_TM, X6_TK, mx::layout::row_major> Alo, Ahi;
+                            const int8_t * xg = xa + (size_t) t * X6_TM * 2 * K + (size_t) (b * 8 + g) * 64;
+                            mx::joint_matrix_load(sg, Alo, sycl::address_space_cast<address_space::global_space, decorated::no>(xg), 2 * K);
+                            mx::joint_matrix_load(sg, Ahi, sycl::address_space_cast<address_space::global_space, decorated::no>(xg + 32), 2 * K);
+                            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, X6_TM, X6_TN> Clo, Chi;
+                            mx::joint_matrix_fill(sg, Clo, 0);
+                            mx::joint_matrix_fill(sg, Chi, 0);
+                            mx::joint_matrix_mad(sg, Clo, Alo, B, Clo);
+                            mx::joint_matrix_mad(sg, Chi, Ahi, B, Chi);
+                            // column-side d8 broadcast (register regions); these sub-group ops must stay outside the
+                            // joint_matrix_apply lambdas
+                            float db[8];
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                if constexpr (MC == 8) {
+                                    db[i] = sycl::select_from_group(sg, d8c[i & 3], 2 * g + (i >> 2));
+                                } else {
+                                    db[i] = sycl::select_from_group(sg, d8c[i], 2 * g + t);
+                                }
+                            }
+                            float lo[8];
+                            {
+                                int i = 0;
+                                imx::joint_matrix_apply(sg, Clo, [&](int32_t & v, size_t, size_t) {
+                                    if (i < 8) { lo[i] = (float) v * scf[2 * g]; }
+                                    ++i;
+                                });
+                            }
+                            {
+                                int i = 0;
+                                imx::joint_matrix_apply(sg, Chi, [&](int32_t & v, size_t, size_t) {
+                                    if (i < 8) { Fb[t * 8 + i] = sycl::fma(sycl::fma((float) v, scf[2 * g + 1], lo[i]), db[i], Fb[t * 8 + i]); }
+                                    ++i;
+                                });
+                            }
+                        }
+                    }
+                    sycl::group_barrier(sg);
+                }
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { F[i] = sycl::fma(dq, Fb[i], F[i]); }
+            }
+            if (ks > 1) {
+#pragma unroll
+                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
+                sycl::group_barrier(it.get_group());
+                if (s == 0) {
+#pragma unroll
+                    for (int i = 0; i < MC; ++i) {
+                        float acc = red[i * 16 + lane];
+                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
+                        F[i] = acc;
+                    }
+                }
+            }
+            if (s == 0) {
+#pragma unroll
+                for (int i = 0; i < MC; ++i) {
+                    if (i < M) { dOut[(size_t) i * ldd + row0 + lane] = F[i]; }
+                }
+            }
+        });
+    });
+}
+
 // GGML_SYCL_XMX_Q6K_CHECKQ=1: compare the fused quantizer's operands (columns < M) with the legacy quantize + pack
 void xmx_q6k_checkq(const float * x, const int8_t * xa, const sycl::half * d8, int K, int M,
                     ggml_backend_sycl_context & ctx, sycl::queue & q) {
@@ -503,11 +701,74 @@ void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tenso
     const int64_t G = K / QK8_1;
     GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == N && dst->ne[1] == M);
     GGML_ASSERT(K % QK_K == 0 && N % XMX_Q6K_ROWS == 0);
-    GGML_ASSERT(M >= 1 && M <= X6_MC);
+    GGML_ASSERT(M >= 1 && M <= XMX_Q6K_MAX_COLS);
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     GGML_ASSERT(extra && extra->optimized_feature.reorder);
 
     const xmx_q6k_weights w = xmx_q6k_weights_of(static_cast<const char *>(src0->data), N, K);
+
+    if (M > X6_MC) {
+        // LOCAL (longdraft): 9..16 columns, two A tiles: xa [16][2K], d8 [G][16]
+        const size_t xa16 = (size_t) 2 * X6_TM * 2 * K;
+        const size_t d816 = (size_t) G * 2 * X6_TM * sizeof(sycl::half);
+        ggml_sycl_pool_alloc<char> act16(ctx.pool(), xa16 + d816);
+        int8_t *     xa = reinterpret_cast<int8_t *>(act16.get());
+        sycl::half * d8 = reinterpret_cast<sycl::half *>(act16.get() + xa16);
+        sycl::queue & q = *ctx.stream();
+        static const int ks16 = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_KS16", 0);
+        // LOCAL (wideverify): the register-fed two-tile kernel (GGML_SYCL_XMX_Q6K_DIRECT=1 + GGML_SYCL_XMX_WIDE=1),
+        // activations in the group-major [G][2][16][32] layout; same per-column math and order as the joint_matrix
+        // two-tile kernel, bit-identical to it at the same ks. Split-K: the 1..8 register-fed kernel's rule. Not for
+        // ffn_down-like shapes (>= 64 blocks per row, <= 8192 rows), where the joint_matrix kernel is faster at 9..16
+        // columns (B70, test-backend-ops perf, 5120x17408, us at 9 / 16 columns: joint_matrix ks 3 ~165; register-fed
+        // ks 16 187 / 190, ks 10 230 / 235, ks 3 244 / 220); GGML_SYCL_XMX_Q6K_DIRECT16_ALL=1 takes them too.
+        static const bool d16_all = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT16_ALL", 0) != 0;
+        const bool direct16 = ggml_sycl_xmx_q6k_direct_env() && ggml_sycl_xmx_direct_wide() &&
+                              (d16_all || !((K / QK_K) >= 64 && N <= 8192));
+        const float * x = static_cast<const float *>(src1->data);
+        xmx_q6k_quant_act<2 * X6_TM>(x, xa, d8, (int) K, (int) M, q, direct16);
+        int ks = xmx_q6k_pick_ks((int) N, (int) K);
+        if (direct16) {
+            static const int ks_env = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_KS", -1);
+            if (ks_env < 0 && (K / QK_K) >= 64 && N <= 8192) {
+                ks = 16;
+            } else if (ks_env > 0) {
+                ks = std::min(ks_env, (int) (K / QK_K));
+            }
+        }
+        if (ks16 > 0) {
+            ks = std::max(1, std::min(ks16, std::min(16, (int) (K / QK_K))));
+        }
+        if (direct16) {
+            ggml_sycl_xmx_q6k_direct16_launch(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N,
+                                              (int) K, (int) M, dst->ne[0], ks, q);
+            static const bool dcheck = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_CHECK", 0) != 0;
+            if (dcheck) {   // measurement only (synchronous): the joint_matrix two-tile kernel at the same ks, bit for bit
+                ggml_sycl_pool_alloc<char>  ref_act(ctx.pool(), xa16 + d816);
+                ggml_sycl_pool_alloc<float> ref_out(ctx.pool(), (size_t) M * N);
+                int8_t *     rxa = reinterpret_cast<int8_t *>(ref_act.get());
+                sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa16);
+                xmx_q6k_quant_act<2 * X6_TM>(x, rxa, rd8, (int) K, (int) M, q, false);
+                xmx_q6k_launch_wide<2 * X6_TM>(w.ql, w.qh, w.sc, w.dd, rxa, rd8, ref_out.get(), (int) N, (int) K, (int) M,
+                                               N, ks, q);
+                q.wait();
+                std::vector<float> a((size_t) M * N), r((size_t) M * N);
+                const float * out = static_cast<const float *>(dst->data);
+                for (int64_t i = 0; i < M; ++i) {
+                    q.memcpy(a.data() + i * N, out + i * dst->ne[0], N * sizeof(float));
+                }
+                q.memcpy(r.data(), ref_out.get(), r.size() * sizeof(float)).wait();
+                size_t nd = 0;
+                for (size_t i = 0; i < a.size(); ++i) { nd += memcmp(&a[i], &r[i], sizeof(float)) != 0; }
+                fprintf(stderr, "XMXDIRECTCHECK q6_K N=%lld K=%lld M=%lld ks=%d: %s (%zu of %zu differ)\n", (long long) N,
+                        (long long) K, (long long) M, ks, nd == 0 ? "IDENTICAL" : "MISMATCH", nd, a.size());
+            }
+            return;
+        }
+        xmx_q6k_launch_wide<2 * X6_TM>(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N,
+                                       (int) K, (int) M, dst->ne[0], ks, q);
+        return;
+    }
 
     const size_t xa_bytes = (size_t) X6_TM * 2 * K;
     const size_t d8_bytes = (size_t) G * X6_TM * sizeof(sycl::half);
@@ -567,7 +828,7 @@ void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tenso
     }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 void ggml_sycl_op_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx,const ggml_tensor * src0, const ggml_tensor * src1,
@@ -606,7 +867,7 @@ void ggml_sycl_op_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx,const ggml_ten
                    xmx_q6k_pick_ks((int) N, (int) K), *stream);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #else  // !GGML_SYCL_XMX

@@ -17,6 +17,14 @@
 
 #include "common.hpp"
 
+// GGML_SYCL_XMX_WIDE=1 (LOCAL longdraft, default off), read once: the XMX q6_K / q8_0 matmuls and the XMX flash
+// attention serve 9..16 columns (verify batches of up to 16 tokens); their 1..8-column kernels are unchanged
+bool ggml_sycl_xmx_wide();
+
+// LOCAL (wideverify): GGML_SYCL_XMX_WIDE=1 and GGML_SYCL_XMX_DIRECT_WIDE != 0 (default 1): the register-fed q4_K / q6_K
+// kernels (their DIRECT switches) also serve 9..16 columns
+bool ggml_sycl_xmx_direct_wide();
+
 // true when src0 x src1 -> dst is a q8_0 mul_mat this path can serve on ctx.device (type, shape, column window,
 // size, env, device); no side effects. The caller must still make sure src0 is in the reorder layout.
 bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,

@@ -11,6 +11,7 @@
 #include "mmq-xmx-q4k.hpp"
 #include "mmq-dnn-u4.hpp"
 #include "mmq-xmx-direct.hpp"
+#include "mmq-xmx-q80.hpp"   // ggml_sycl_xmx_direct_wide (LOCAL wideverify)
 #include "quants.hpp"
 #include "quantize.hpp"
 
@@ -663,7 +664,9 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
     // register-fed DPAS kernel for 1..8 columns (GGML_SYCL_XMX_Q4K_DIRECT=1): same partition (split-K) and operation
     // order as xmx_q4k_matmul, so bit-identical; very tall weights (a 98k-row draft head, where the rule of thumb gives
     // ks = 1) get ks 5: 530 -> 493 us on 98304x5120, not bit-identical to ks 1 there (float order of 5 partial sums)
-    const bool direct = ggml_sycl_xmx_q4k_direct_env() && M <= 8;
+    // LOCAL (wideverify): 9..16 columns on the two-tile register-fed kernel with GGML_SYCL_XMX_WIDE=1 (the same
+    // partition and per-column operation order as xmx_q4k_launch<16>, so bit-identical to it at the same ks)
+    const bool direct = ggml_sycl_xmx_q4k_direct_env() && (M <= 8 || ggml_sycl_xmx_direct_wide());
     std::vector<sycl::event> ev;
     ev.push_back(xmx_q4k_quant_act(x, xa, d8, us, (int) K, (int) M, *q, direct));
     if (checkq && !direct) {
@@ -674,8 +677,17 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
         if (N >= 65536 && ks < 5) {
             ks = std::max(1, std::min(5, (int) (K / QK_K) / 4));
         }
-        ev.push_back(ggml_sycl_xmx_q4k_direct_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
-                                                     dst->ne[0], ks, *q));
+        if (M > 8) {
+            static const int ks16_env = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT16_KS", 0);   // tuning only
+            if (ks16_env > 0) {
+                ks = std::max(1, std::min(ks16_env, std::min(16, (int) (K / QK_K))));
+            }
+            ev.push_back(ggml_sycl_xmx_q4k_direct16_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
+                                                           dst->ne[0], ks, *q));
+        } else {
+            ev.push_back(ggml_sycl_xmx_q4k_direct_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
+                                                         dst->ne[0], ks, *q));
+        }
         // GGML_SYCL_XMX_Q4K_DIRECT_CHECK=1 (measurement only, synchronous): rerun the op on the joint_matrix kernel
         // (same split-K) and compare every output bit for bit
         static const bool dcheck = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT_CHECK", 0) != 0;
@@ -686,7 +698,11 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
             sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa_bytes);
             int32_t *    rus = reinterpret_cast<int32_t *>(ref_act.get() + xa_bytes + d8_bytes);
             xmx_q4k_quant_act(x, rxa, rd8, rus, (int) K, (int) M, *q, false);
-            xmx_q4k_launch<8, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
+            if (M > 8) {
+                xmx_q4k_launch<16, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
+            } else {
+                xmx_q4k_launch<8, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
+            }
             q->wait();
             std::vector<float> a((size_t) M * N), r((size_t) M * N);
             for (int64_t i = 0; i < M; ++i) {
@@ -710,7 +726,7 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
     }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -750,7 +766,7 @@ void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_te
     xmx_q4k_matmul(w, xa, d8, us, dst_dd_i, (int) N, (int) K, (int) M, dst->ne[0], *stream);
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    GGML_SYCL_EXIT_OR_RETHROW();
 }
 
 #else  // !GGML_SYCL_XMX
