@@ -1041,6 +1041,12 @@ bool common_prompt_batch_decode(
 // used after loading session state to ensure the sampling context has valid logits
 bool common_replay_last_token(struct llama_context * ctx, llama_token last_token, int32_t pos);
 
+// [switchcost] env LLAMA_SWITCH_PROF=1 (default 0): one stderr line per request stage, "[swp] <ms since start> | msg",
+// for the timeline of a conversation switch (request -> template -> tokenize -> slot / prompt cache -> prompt eval)
+bool common_swp_on();
+void common_swp(const char * fmt, ...);
+
+
 //
 // Vocab utils
 //

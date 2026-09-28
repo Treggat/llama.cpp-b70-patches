@@ -300,42 +300,102 @@ struct server_slot {
     server_prompt prompt;
 
     // `keep` is the cached state that is going to be loaded into this slot right after saving (see server_prompt_cache::alloc)
-    bool prompt_save(server_prompt_cache & prompt_cache, const server_prompt_cache_state * keep = nullptr) const {
+    // [switchcost] checkpoints with pos_max > ckpt_move_pos are moved into the cache entry (LLAMA_PCACHE_CKPT_MOVE)
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_prompt_cache_state * keep = nullptr,
+            llama_pos ckpt_move_pos = std::numeric_limits<llama_pos>::max()) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
         const bool hp = llama_hprof_enabled(); // [prefill2] LLAMA_HOST_PROF: prompt-cache save split
         int64_t hp_t0 = hp ? ggml_time_us() : 0;
+        const bool swp = common_swp_on(); // [switchcost]
+        const int64_t sw0 = ggml_time_us();
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         if (hp) { llama_hprof_record("psave.size", hp_t0); hp_t0 = ggml_time_us(); }
+        const int64_t sw1 = ggml_time_us();
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep);
+        size_t n_ckpt = 0;
+        size_t n_ckpt_move = 0;
+        size_t ckpt_bytes = 0;
+        for (const auto & ckpt : prompt.checkpoints) {
+            n_ckpt++;
+            n_ckpt_move += ckpt.pos_max > ckpt_move_pos;
+            ckpt_bytes += ckpt.size();
+        }
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep, ckpt_move_pos);
         if (hp) { llama_hprof_record("psave.alloc", hp_t0); hp_t0 = ggml_time_us(); }
+        const int64_t sw2 = ggml_time_us();
         if (cur == nullptr) {
+            if (swp) {
+                common_swp("save skipped (%d tokens already cached or over the limit) | size %.1f alloc %.1f ms",
+                        (int) prompt.tokens.size(), (sw1 - sw0) / 1000.0, (sw2 - sw1) / 1000.0);
+            }
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // [switchcost] LLAMA_PCACHE_KEEP: rows unchanged since this slot's last restore come from the shadow copy
+        static const int keep_mode = server_pcache_env("LLAMA_PCACHE_KEEP");
+        const bool use_ref = keep_mode > 0 && prompt_cache.shadow_slot == id;
+        size_t reused_tgt = 0;
+        size_t reused_dft = 0;
+
+        if (use_ref) {
+            llama_state_seq_get_data_ref(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE,
+                    prompt_cache.shadow.main.data(), prompt_cache.shadow.main.size(), &reused_tgt);
+        } else {
+            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
         if (hp) { llama_hprof_record("psave.get_tgt", hp_t0); hp_t0 = ggml_time_us(); }
+        const int64_t sw3 = ggml_time_us();
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (use_ref && !prompt_cache.shadow.drft.empty()) {
+                llama_state_seq_get_data_ref(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE,
+                        prompt_cache.shadow.drft.data(), prompt_cache.shadow.drft.size(), &reused_dft);
+            } else {
+                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
         }
         if (hp) { llama_hprof_record("psave.get_dft", hp_t0); }
+        const int64_t sw4 = ggml_time_us();
+
+        // [switchcost] LLAMA_PCACHE_KEEP=2: the saved bytes must equal a plain full read of the state
+        if (keep_mode >= 2) {
+            server_pcache_verify_state("save", ctx_tgt, ctx_dft, id, cur->data);
+        }
+
+        // the new entry holds the current state: the shadow of this slot is no longer needed
+        if (prompt_cache.shadow_slot == id) {
+            prompt_cache.shadow_drop();
+        }
+
+        if (swp) {
+            common_swp("save %d tokens: tgt %.1f MiB (%.1f reused), dft %.1f MiB (%.1f reused), %zu ckpt %.1f MiB (%zu moved) | "
+                    "size %.1f alloc %.1f get_tgt %.1f get_dft %.1f ms",
+                    (int) cur->prompt.tokens.size(), cur_size_tgt / 1048576.0, reused_tgt / 1048576.0,
+                    cur_size_dft / 1048576.0, reused_dft / 1048576.0, n_ckpt, ckpt_bytes / 1048576.0, n_ckpt_move,
+                    (sw1 - sw0) / 1000.0, (sw2 - sw1) / 1000.0, (sw3 - sw2) / 1000.0, (sw4 - sw3) / 1000.0);
+        }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
+        const int64_t sw0 = ggml_time_us();
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (hp_t0) llama_hprof_record("pload", hp_t0);
+        if (common_swp_on()) {
+            common_swp("load done: slot has %d tokens, %zu ckpt | %.1f ms", prompt.n_tokens(), prompt.checkpoints.size(),
+                    (ggml_time_us() - sw0) / 1000.0);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -777,6 +837,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
+                const int64_t sw_dec = ggml_time_us(); // [switchcost]
                 res = mtmd_helper_decode_image_chunk(
                     mctx,
                     slot.ctx_tgt,
@@ -794,6 +855,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     return -1;
                 }
                 n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+                if (common_swp_on()) {
+                    common_swp("mtmd decode into the LLM: %zu tokens | %.1f ms", n_tokens_out, (ggml_time_us() - sw_dec) / 1000.0);
+                }
                 return 0; // success
             }
         }
@@ -834,7 +898,11 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t sw_enc = ggml_time_us(); // [switchcost]
     res = mtmd_batch_encode(mbatch.get());
+    if (common_swp_on()) {
+        common_swp("mtmd encode: %d chunk(s) from idx %zu | %.1f ms", n_added, idx, (ggml_time_us() - sw_enc) / 1000.0);
+    }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -1614,6 +1682,11 @@ private:
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
+                if (common_swp_on()) {
+                    common_swp("slot select: LCP sim %.3f of %d new tokens, f_keep %.3f of %d slot tokens",
+                            f_sim_best, (int) task.tokens.size(), f_keep, (int) ret->prompt.tokens.size());
+                }
+
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
@@ -1676,13 +1749,28 @@ private:
 
             update_cache = update_cache && can_cache;
 
+            if (common_swp_on()) {
+                common_swp("prompt cache: %zu entries, better match %s (%d tokens), update %d",
+                        prompt_cache ? prompt_cache->states.size() : (size_t) 0, better ? "yes" : "no",
+                        better ? better->prompt.n_tokens() : 0, (int) update_cache);
+            }
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
+                // [switchcost] LLAMA_PCACHE_CKPT_MOVE: the slot's checkpoints are replaced by the restored ones
+                static const bool ckpt_move = server_pcache_env("LLAMA_PCACHE_CKPT_MOVE") > 0;
+
+                // the slot drops every checkpoint when `better` is restored, else those past the common prefix
+                llama_pos move_pos = std::numeric_limits<llama_pos>::max();
+                if (ckpt_move) {
+                    move_pos = better ? -1 : ret->prompt.tokens.pos_next(ret->prompt.tokens.get_common_prefix(task.tokens));
+                }
+
                 // note: `better` is protected from eviction while the current state is being saved
-                ret->prompt_save(*prompt_cache, better);
+                ret->prompt_save(*prompt_cache, better, move_pos);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -1691,6 +1779,9 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                if (common_swp_on()) {
+                    common_swp("prompt cache update done | %.1f ms", (ggml_time_us() - t_start) / 1000.0);
+                }
             }
         }
 
@@ -1865,6 +1956,9 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        if (common_swp_on()) {
+            common_swp("task %d launched", slot.task->id);
+        }
         return true;
     }
 
@@ -2437,7 +2531,15 @@ private:
 
                     const int id_task = task.id;
 
+                    if (common_swp_on()) {
+                        common_swp("task %d dequeued (%d tokens)", id_task, (int) task.tokens.size());
+                    }
+
                     server_slot * slot = get_available_slot(task);
+
+                    if (common_swp_on()) {
+                        common_swp("task %d slot chosen", id_task);
+                    }
 
                     //
                     // slot scheduling logic
@@ -3239,6 +3341,10 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
+                        if (common_swp_on()) {
+                            common_swp("prompt start (task %d, %d tokens) = timings.prompt_ms t0", slot.task->id, slot.task->n_tokens());
+                        }
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3463,6 +3569,7 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        const int64_t sw_cr = ggml_time_us(); // [switchcost]
                                         const int64_t hp_cr0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         if (hp_cr0) llama_hprof_record("srv.ckpt.restore.tgt", hp_cr0);
@@ -3475,6 +3582,10 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (common_swp_on()) {
+                                            common_swp("checkpoint restored (n_tokens %" PRId64 ", %.1f MiB) | %.1f ms", it->n_tokens,
+                                                    it->size() / 1048576.0, (ggml_time_us() - sw_cr) / 1000.0);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -3509,6 +3620,11 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+
+                        if (common_swp_on()) {
+                            common_swp("n_past %d of %d (slot kept %d, %zu ckpt)", n_past, slot.task->n_tokens(),
+                                    slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
+                        }
 
                         metrics.add_prompt_cached(n_past);
 
@@ -3984,6 +4100,9 @@ private:
 
             if (slot.stats.n_gen == 1) {
                 slot.stats.update_prompt_last();
+                if (common_swp_on()) {
+                    common_swp("first token sampled (task %d)", slot.task->id);
+                }
                 slot.t_print_last = t_now;
                 slot.n_gen_last = 0;
             }
@@ -4432,12 +4551,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
+        const int64_t sw_tok = ggml_time_us(); // [switchcost]
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+        }
+        if (common_swp_on()) {
+            common_swp("http tokenize (%zu files, %d tokens) %.1f ms", files.size(),
+                    inputs.empty() ? 0 : (int) inputs[0].size(), (ggml_time_us() - sw_tok) / 1000.0);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -5069,13 +5193,22 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
+        const int64_t sw0 = ggml_time_us(); // [switchcost]
+        if (common_swp_on()) {
+            common_swp("http chat request received (%zu bytes)", req.body.size());
+        }
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        const int64_t sw1 = ggml_time_us();
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
+        if (common_swp_on()) {
+            common_swp("http json parse %.1f ms, chat template + files (%zu) %.1f ms", (sw1 - sw0) / 1000.0, files.size(),
+                    (ggml_time_us() - sw1) / 1000.0);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

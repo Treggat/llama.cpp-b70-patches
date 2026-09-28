@@ -11,6 +11,10 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <mutex>
+#include <algorithm>
+
+#include "ggml-backend.h"
 
 //
 // task_params
@@ -1686,16 +1690,302 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// [switchcost] prompt-cache state buffers and their reuse pool
+//
+int server_pcache_env(const char * name) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : 0;
+}
+
+static int server_pcache_pool_mode() {
+    static const int v = server_pcache_env("LLAMA_PCACHE_POOL");
+    return v;
+}
+
+namespace {
+struct pcache_block {
+    ggml_backend_buffer_t buf  = nullptr;
+    uint8_t *             base = nullptr;
+    size_t                cap  = 0;
+};
+
+struct pcache_pool {
+    std::mutex mtx;
+    std::vector<pcache_block *> free_blocks;
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+    ggml_backend_buffer_type_t buft = nullptr;
+    bool buft_init = false;
+};
+
+pcache_pool & pcache_pool_get() {
+    static pcache_pool * p = new pcache_pool(); // never destroyed: states may be released during static destruction
+    return *p;
+}
+
+constexpr size_t PCACHE_BLOCK_ALIGN = 64ull << 20;
+
+size_t pcache_block_cap(size_t n) {
+    n = std::max<size_t>(n, 1);
+    n += n/8;
+    return ((n + PCACHE_BLOCK_ALIGN - 1) / PCACHE_BLOCK_ALIGN) * PCACHE_BLOCK_ALIGN;
+}
+
+// pinned host memory of the first GPU (mode 1), or plain host memory (mode 2 / no GPU host buffer type)
+ggml_backend_buffer_type_t pcache_buft(pcache_pool & pool) {
+    if (!pool.buft_init) {
+        pool.buft_init = true;
+        if (server_pcache_pool_mode() == 1) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (dev) {
+                pool.buft = ggml_backend_dev_host_buffer_type(dev);
+            }
+        }
+        if (!pool.buft) {
+            pool.buft = ggml_backend_cpu_buffer_type();
+        }
+        SRV_INF("[pcache] pool buffer type: %s\n", ggml_backend_buft_name(pool.buft));
+    }
+    return pool.buft;
+}
+
+pcache_block * pcache_acquire(size_t n, bool only_free = false) {
+    auto & pool = pcache_pool_get();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+
+    // the smallest free block that holds n bytes and does not waste more than half of n (+ 128 MiB)
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < pool.free_blocks.size(); ++i) {
+        const size_t cap = pool.free_blocks[i]->cap;
+        if (cap >= n && cap <= n + n/2 + (128ull << 20) && (best == SIZE_MAX || cap < pool.free_blocks[best]->cap)) {
+            best = i;
+        }
+    }
+    if (best != SIZE_MAX) {
+        pcache_block * b = pool.free_blocks[best];
+        pool.free_blocks.erase(pool.free_blocks.begin() + best);
+        pool.free_bytes -= b->cap;
+        return b;
+    }
+    if (only_free) {
+        return nullptr;
+    }
+
+    // 1/8 headroom: the block of a growing conversation can be reused for its next saves
+    const size_t cap = pcache_block_cap(n);
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(pcache_buft(pool), cap);
+    if (!buf) {
+        return nullptr;
+    }
+    auto * b = new pcache_block();
+    b->buf  = buf;
+    b->base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    b->cap  = cap;
+    pool.total_bytes += cap;
+    SRV_INF("[pcache] new pool block %.1f MiB (%s) in %.1f ms, pool total %.1f MiB\n", cap / 1048576.0,
+            ggml_backend_buffer_name(buf), (ggml_time_us() - t0) / 1000.0, pool.total_bytes / 1048576.0);
+    return b;
+}
+
+void pcache_give(pcache_block * b) {
+    auto & pool = pcache_pool_get();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+    pool.free_blocks.push_back(b);
+    pool.free_bytes += b->cap;
+}
+} // namespace
+
+size_t server_pcache_pool_free() {
+    auto & pool = pcache_pool_get();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+    return pool.free_bytes;
+}
+
+size_t server_pcache_pool_trim(size_t n_bytes) {
+    auto & pool = pcache_pool_get();
+    std::lock_guard<std::mutex> lk(pool.mtx);
+    size_t freed = 0;
+    // largest blocks first
+    std::sort(pool.free_blocks.begin(), pool.free_blocks.end(), [](const pcache_block * a, const pcache_block * b) { return a->cap > b->cap; });
+    while (freed < n_bytes && !pool.free_blocks.empty()) {
+        pcache_block * b = pool.free_blocks.front();
+        pool.free_blocks.erase(pool.free_blocks.begin());
+        pool.free_bytes  -= b->cap;
+        pool.total_bytes -= b->cap;
+        freed += b->cap;
+        SRV_INF("[pcache] releasing pool block %.1f MiB\n", b->cap / 1048576.0);
+        ggml_backend_buffer_free(b->buf);
+        delete b;
+    }
+    return freed;
+}
+
+server_state_buf::server_state_buf(server_state_buf && other) noexcept {
+    *this = std::move(other);
+}
+
+server_state_buf & server_state_buf::operator=(server_state_buf && other) noexcept {
+    if (this != &other) {
+        release();
+        vec = std::move(other.vec);
+        ptr = other.ptr;
+        n   = other.n;
+        cap = other.cap;
+        blk = other.blk;
+        other.vec = std::vector<uint8_t>();
+        other.ptr = nullptr;
+        other.n   = 0;
+        other.cap = 0;
+        other.blk = nullptr;
+    }
+    return *this;
+}
+
+server_state_buf::~server_state_buf() {
+    release();
+}
+
+void server_pcache_verify_state(const char * what, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id,
+        const server_prompt_data & data) {
+    auto check = [&](const char * part, llama_context * ctx, const server_state_buf & buf) {
+        if (!ctx || buf.empty()) {
+            return;
+        }
+        const size_t n = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        std::vector<uint8_t> tmp(n);
+        const size_t got = llama_state_seq_get_data_ext(ctx, tmp.data(), n, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const bool same = got == buf.size() && memcmp(tmp.data(), buf.data(), buf.size()) == 0;
+        SRV_WRN("[pcache] state check after %s: %s %.1f MiB %s\n", what, part, buf.size() / 1048576.0,
+                same ? "identical" : "DIFFERENT");
+        if (!same) {
+            GGML_ABORT("[pcache] state check failed");
+        }
+    };
+    check("tgt", ctx_tgt, data.main);
+    check("dft", ctx_dft, data.drft);
+}
+
+bool server_pcache_pool_on() {
+    return server_pcache_pool_mode() != 0;
+}
+
+size_t server_pcache_block_size(size_t n) {
+    return n == 0 ? 0 : pcache_block_cap(n);
+}
+
+bool server_state_buf::alloc_pooled(size_t size) {
+    release();
+    if (server_pcache_pool_mode() == 0 || size == 0) {
+        return false;
+    }
+    auto * b = pcache_acquire(size, /*only_free =*/ true);
+    if (!b) {
+        return false;
+    }
+    blk = b;
+    ptr = b->base;
+    n   = size;
+    cap = b->cap;
+    return true;
+}
+
+bool server_state_buf::alloc(size_t size) {
+    release();
+    if (server_pcache_pool_mode() == 0 || size == 0) {
+        // as before: a fresh, zero-filled vector
+        try {
+            std::vector<uint8_t> v;
+            v.resize(size);
+            vec.swap(v);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+        ptr = vec.data();
+        n   = size;
+        cap = vec.capacity();
+        return true;
+    }
+    auto * b = pcache_acquire(size);
+    if (!b) {
+        return false;
+    }
+    blk = b;
+    ptr = b->base;
+    n   = size;
+    cap = b->cap;
+    return true;
+}
+
+void server_state_buf::release() {
+    if (blk) {
+        pcache_give((pcache_block *) blk);
+        blk = nullptr;
+    } else {
+        vec = std::vector<uint8_t>();
+    }
+    ptr = nullptr;
+    n   = 0;
+    cap = 0;
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
+        res += state.mem();
     }
 
-    return res;
+    return res + shadow.mem() + server_pcache_pool_free();
+}
+
+void server_prompt_cache::make_room(const std::function<size_t()> & n_new, const server_prompt_cache_state * keep,
+        const std::function<void()> & on_freed) {
+    if (limit_size == 0) {
+        return;
+    }
+
+    // the state that is about to be loaded leaves the cache right after this call - its size is reclaimable
+    const size_t size_keep = keep ? keep->mem() : 0;
+
+    auto excess = [&]() -> size_t {
+        const size_t tot = size() - size_keep + n_new();
+        return tot > limit_size ? tot - limit_size : 0;
+    };
+
+    // note: never evict `keep` - it is the state that the caller is switching to
+    // [switchcost] free pool blocks go first, then the shadow; dropped / evicted buffers return to the pool, which is
+    // trimmed again before the next state is evicted
+    while (excess() > 0) {
+        if (server_pcache_pool_free() > 0) {
+            server_pcache_pool_trim(excess());
+            continue;
+        }
+        if (shadow_slot >= 0) {
+            SRV_WRN(" - making room for prompt cache entry, dropping the shadow copy (size = %.3f MiB)\n", shadow.mem() / (1024.0 * 1024.0));
+            shadow_drop();
+            on_freed();
+            continue;
+        }
+
+        auto it = states.begin();
+        while (it != states.end() && &*it == keep) {
+            ++it;
+        }
+
+        if (it == states.end()) {
+            break;
+        }
+
+        SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                it->size() / (1024.0 * 1024.0));
+
+        states.erase(it);
+        on_freed();
+    }
 }
 
 size_t server_prompt_cache::n_tokens() const {
@@ -1708,7 +1998,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_prompt_cache_state * keep) {
+server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_prompt_cache_state * keep, llama_pos ckpt_move_pos) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1747,38 +2037,41 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    if (limit_size > 0) {
-        // the state that is about to be loaded leaves the cache right after this call - its size is reclaimable
-        const size_t size_keep = keep ? keep->size() : 0;
+    server_prompt_data state_data;
 
-        // make room before allocating the new vectors to avoid breaching the limit
-        // note: never evict `keep` - it is the state that the caller is switching to
-        while (size() - size_keep + state_size_new > limit_size) {
-            auto it = states.begin();
-            while (it != states.end() && &*it == keep) {
-                ++it;
-            }
-
-            if (it == states.end()) {
-                break;
-            }
-
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    it->size() / (1024.0 * 1024.0));
-
-            states.erase(it);
+    // make room before allocating the new buffers to avoid breaching the limit
+    // [switchcost] with the pool, fitting free blocks are taken first (they leave the pool's free bytes and are
+    // counted as part of the new entry); a new block counts with its rounded-up size
+    // blocks freed by an eviction (or the shadow drop) while making room are taken before the pool is trimmed again
+    const bool pool = server_pcache_pool_on();
+    auto try_pool = [&]() {
+        if (!pool) {
+            return;
         }
-    }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+        if (state_data.main.size() != state_size_tgt) {
+            state_data.main.alloc_pooled(state_size_tgt);
+        }
+        if (state_data.drft.size() != state_size_dft) {
+            state_data.drft.alloc_pooled(state_size_dft);
+        }
+    };
+    auto n_new = [&]() -> size_t {
+        if (!pool) {
+            return state_size_new;
+        }
+        return checkpoints_size +
+            (state_data.main.size() == state_size_tgt ? state_data.main.mem() : server_pcache_block_size(state_size_tgt)) +
+            (state_data.drft.size() == state_size_dft ? state_data.drft.mem() : server_pcache_block_size(state_size_dft));
+    };
+    try_pool();
+    make_room(n_new, keep, try_pool);
 
     // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+    if ((state_data.main.size() != state_size_tgt && !state_data.main.alloc(state_size_tgt)) ||
+        (state_data.drft.size() != state_size_dft && !state_data.drft.alloc(state_size_dft))) {
+        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", "std::bad_alloc");
+
+        state_data.release();
 
         limit_size = std::max<size_t>(1, 0.4*size());
 
@@ -1789,15 +2082,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // [switchcost] checkpoints with pos_max > ckpt_move_pos are moved (the slot drops them anyway), the rest is copied;
+    // the order is kept
+    std::list<common_prompt_checkpoint> ckpts;
+    for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+        if (it->pos_max > ckpt_move_pos) {
+            auto cur = it++;
+            ckpts.splice(ckpts.end(), prompt.checkpoints, cur);
+        } else {
+            ckpts.push_back(*it);
+            ++it;
+        }
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(ckpts),
         },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
+        /*.data   =*/ std::move(state_data),
     });
 
     return &states.back();
@@ -1846,19 +2149,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     auto it_best = find_better(prompt, tokens_new);
 
     if (it_best != states.end()) {
+        const int64_t sw0 = ggml_time_us(); // [switchcost]
+        int64_t sw1 = sw0;
         {
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            sw1 = ggml_time_us();
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1874,10 +2178,32 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
+        }
+
+        if (common_swp_on()) {
+            common_swp("restore %d tokens: tgt %.1f MiB %.1f ms, dft %.1f MiB %.1f ms", it_best->prompt.n_tokens(),
+                    it_best->data.main.size() / 1048576.0, (sw1 - sw0) / 1000.0, it_best->data.drft.size() / 1048576.0,
+                    (ggml_time_us() - sw1) / 1000.0);
+        }
+
+        // [switchcost] LLAMA_PCACHE_KEEP: keep the restored host copy as the reference of the next save of this slot
+        static const int keep_mode = server_pcache_env("LLAMA_PCACHE_KEEP");
+
+        // LLAMA_PCACHE_KEEP=2: the restored device state, read back in full, must equal the bytes that were loaded
+        if (keep_mode >= 2) {
+            server_pcache_verify_state("restore", ctx_tgt, ctx_dft, id_slot, it_best->data);
+        }
+        if (keep_mode > 0) {
+            shadow_drop();
+            shadow      = std::move(it_best->data);
+            shadow_slot = id_slot;
+            llama_state_seq_ref_mark(ctx_tgt, id_slot);
+            if (ctx_dft && !shadow.drft.empty()) {
+                llama_state_seq_ref_mark(ctx_dft, id_slot);
+            }
+        } else {
+            it_best->data.release();
         }
 
         SRV_INF(" - restored prompt from cache: %d tokens, %d in common with the new prompt (%d tokens)\n",
@@ -1893,7 +2219,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
+        // [switchcost] free pool blocks and the shadow go first; evicted buffers return to the pool (trimmed again)
+        while (size() > limit_size) {
+            if (server_pcache_pool_free() > 0) {
+                server_pcache_pool_trim(size() - limit_size);
+                continue;
+            }
+            if (shadow_slot >= 0) {
+                shadow_drop();
+                continue;
+            }
+            if (states.empty()) {
+                break;
+            }
+
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
@@ -1917,6 +2256,12 @@ void server_prompt_cache::update() {
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+
+    if (common_swp_on()) {
+        common_swp("cache: %zu prompts, %.1f MiB held (shadow %.1f MiB, pool free %.1f MiB), limit %.1f MiB",
+                states.size(), size() / 1048576.0, shadow.mem() / 1048576.0, server_pcache_pool_free() / 1048576.0,
+                limit_size / 1048576.0);
+    }
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

@@ -124,6 +124,10 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // [switchcost] the data of seq_id now equals a host copy of its state (just saved or restored): start tracking
+    // which rows change from here on, so a later state_write with that copy as reference can skip unchanged rows
+    virtual void ref_mark(llama_seq_id /*seq_id*/) {}
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

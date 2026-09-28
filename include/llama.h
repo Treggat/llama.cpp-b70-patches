@@ -944,6 +944,24 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // [switchcost] like llama_state_seq_get_data_ext, with an earlier host copy of the state of the same sequence as
+    // reference: rows that are unchanged since llama_state_seq_ref_mark() was called for seq_id (right after that copy
+    // was saved or restored) are copied from `ref` instead of the device. The result is the same bytes as without ref.
+    // A reference that does not fit is ignored. n_reused (optional) returns the number of bytes taken from ref.
+    LLAMA_API size_t llama_state_seq_get_data_ref(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                   const uint8_t * ref,
+                          size_t   ref_size,
+                          size_t * n_reused);
+
+    // [switchcost] the device state of seq_id equals a host copy that was just saved or restored: start tracking
+    // which rows change from here on
+    LLAMA_API void llama_state_seq_ref_mark(struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // Decoding
     //

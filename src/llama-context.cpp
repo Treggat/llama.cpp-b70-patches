@@ -2944,16 +2944,70 @@ private:
     size_t size_written = 0;
 };
 
+// [switchcost] LLAMA_PCACHE_KEEP=2: every row taken from a reference state is also read from the device and compared
+static int llama_pcache_keep_mode() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_PCACHE_KEEP");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, const uint8_t * ref = nullptr, size_t ref_size = 0) : ptr(p), buf_size(len), ref(ref), ref_size(ref_size) {}
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+
+        // [switchcost] verify mode: the reused rows must equal the device data bit for bit
+        if (!rinfos.empty()) {
+            size_t n_diff = 0;
+            size_t n_cmp  = 0;
+            std::vector<uint8_t> tmp;
+            for (const auto & r : rinfos) {
+                tmp.resize(r.size);
+                ggml_backend_tensor_get(r.tensor, tmp.data(), r.offset, r.size);
+                n_cmp += r.size;
+                if (memcmp(tmp.data(), r.ptr, r.size) != 0) {
+                    for (size_t i = 0; i < r.size; ++i) {
+                        n_diff += tmp[i] != r.ptr[i];
+                    }
+                }
+            }
+            LLAMA_LOG_WARN("[pcache] verify: %zu reused bytes compared with the device, %zu differ%s\n", n_cmp, n_diff,
+                    n_diff ? " - MISMATCH" : "");
+            if (n_diff) {
+                GGML_ABORT("[pcache] reused state rows differ from the device data");
+            }
+        }
+    }
+
+    const uint8_t * get_ref(size_t & size) const override {
+        size = ref_size;
+        return ref;
+    }
+
+    void write_ref(const uint8_t * src, ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        if (llama_pcache_keep_mode() >= 2) {
+            rinfos.push_back({tensor, ptr, size, offset});
+        }
+        ptr += size;
+        size_written += size;
+        size_reused  += size;
+        buf_size -= size;
+    }
+
+    size_t n_reused() const {
+        return size_reused;
     }
 
     void write(const void * src, size_t size) override {
@@ -2987,6 +3041,10 @@ private:
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    size_t size_reused  = 0;
+
+    const uint8_t * ref = nullptr;
+    size_t ref_size = 0;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -2995,6 +3053,7 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+    std::vector<write_info> rinfos;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3462,6 +3521,40 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_ref(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags,
+        const uint8_t * ref, size_t ref_size, size_t * n_reused) {
+    if (n_reused) {
+        *n_reused = 0;
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        return state_seq_get_data(seq_id, dst, size, flags);
+    }
+
+    size_t res = 0;
+    try {
+        llama_io_write_host io(dst, size, ref, ref_size);
+
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        res = state_seq_write_data(io, seq_id, flags);
+        if (n_reused) {
+            *n_reused = io.n_reused();
+        }
+        // io goes out of scope here: the remaining rows are read from the device
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+    return res;
+}
+
+void llama_context::state_seq_ref_mark(llama_seq_id seq_id) {
+    if (memory) {
+        memory->ref_mark(seq_id);
     }
 }
 
@@ -4596,6 +4689,17 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_data_ref(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags,
+        const uint8_t * ref, size_t ref_size, size_t * n_reused) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_ref(seq_id, dst, size, flags, ref, ref_size, n_reused);
+}
+
+void llama_state_seq_ref_mark(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->state_seq_ref_mark(seq_id);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

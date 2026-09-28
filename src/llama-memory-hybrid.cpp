@@ -201,6 +201,11 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+void llama_memory_hybrid::ref_mark(llama_seq_id seq_id) {
+    // the recurrent part is always written in full; only the attention KV rows can be reused
+    mem_attn->ref_mark(seq_id);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

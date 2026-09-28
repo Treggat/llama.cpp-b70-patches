@@ -2253,6 +2253,28 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// ---- [switchcost] LLAMA_SWITCH_PROF: request timeline marks (see common.h) ----
+bool common_swp_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SWITCH_PROF");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+void common_swp(const char * fmt, ...) {
+    if (!common_swp_on()) {
+        return;
+    }
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    fprintf(stderr, "[swp] %12.3f | %s\n", ggml_time_us() / 1000.0, buf);
+    fflush(stderr);
+}
+
 // ---- [prefill2] LLAMA_CKPT_POOL: reuse of checkpoint state buffers (see common.h) ----
 static bool common_ckpt_pool_on() {
     static const bool v = [] {

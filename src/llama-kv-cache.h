@@ -155,6 +155,8 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    void ref_mark(llama_seq_id seq_id) override;
+
     //
     // llama_kv_cache specific API
     //
@@ -344,8 +346,27 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
 
+    // [switchcost] where the rows of an earlier host copy of the state (the reference) are, see ref_mark()
+    struct ref_layout {
+        const uint8_t * base = nullptr;
+        std::vector<llama_pos> pos;        // position of each reference row
+        std::vector<size_t>    k_off;      // per layer: offset of the first K row in the reference, SIZE_MAX = unusable
+        std::vector<uint64_t>  k_row;
+        std::vector<size_t>    v_off;
+        std::vector<uint64_t>  v_row;
+    };
+
+    bool ref_parse(const uint8_t * ref, size_t ref_size, size_t off, ref_layout & rl) const;
+
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, const ref_layout * rl = nullptr) const;
+
+    // [switchcost] reference tracking (LLAMA_PCACHE_KEEP): the sequence whose cells were marked, its stream and the
+    // reference row of every cell at mark time (-1 = not in the reference)
+    llama_seq_id          ref_seq  = -1;
+    uint32_t              ref_strm = 0;
+    uint32_t              ref_n    = 0;
+    std::vector<int32_t>  ref_row;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);

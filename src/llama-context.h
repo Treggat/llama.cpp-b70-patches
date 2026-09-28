@@ -163,6 +163,11 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // [switchcost] prompt-cache delta save, see llama_state_seq_get_data_ref
+    size_t state_seq_get_data_ref(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags,
+            const uint8_t * ref, size_t ref_size, size_t * n_reused);
+    void   state_seq_ref_mark(llama_seq_id seq_id);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,

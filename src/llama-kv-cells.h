@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -49,6 +50,8 @@ public:
 
         used.clear();
 
+        std::fill(touched.begin(), touched.end(), 1);
+
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
@@ -71,6 +74,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        touched.resize(n);
 
         reset();
     }
@@ -125,6 +129,19 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // [switchcost] per-cell change tracking for the prompt-cache delta save (LLAMA_PCACHE_KEEP): every method that
+    // changes the metadata of a cell - and with it, everything that writes K/V data into the cell (apply_ubatch,
+    // state restore) or changes it (K-shift after pos_add / pos_div) - marks the cell as touched. touch_clear() is
+    // called when the cells are known to hold exactly the data of a host copy of the state.
+    void touch_clear() {
+        std::fill(touched.begin(), touched.end(), 0);
+    }
+
+    bool is_touched(uint32_t i) const {
+        assert(i < touched.size());
+        return touched[i] != 0;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -194,6 +211,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
+            touched[idx] = 1;
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
             }
@@ -225,6 +244,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            touched[idx] = 1;
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -254,6 +275,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        touched[i] = 1;
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -271,6 +294,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        touched[i] = 1;
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -291,6 +316,8 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        touched[i] = 1;
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -366,6 +393,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
+
+        touched[i] = 1;
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
@@ -449,6 +478,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        touched[i] = 1;
+
         pos[i] = p;
 
         used.insert(i);
@@ -456,6 +487,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        touched[i] = 1;
         ext[i] = p;
     }
 
@@ -465,6 +497,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        touched[i] = 1;
 
         seq_pos_rm(i);
 
@@ -496,6 +530,8 @@ public:
         assert(pos[i] != -1);
 
         const llama_pos p_old = pos[i];
+
+        touched[i] = 1;
 
         seq_pos_rm(i);
 
@@ -537,6 +573,9 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // [switchcost] see touch_clear()
+    std::vector<uint8_t> touched;
 
     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache

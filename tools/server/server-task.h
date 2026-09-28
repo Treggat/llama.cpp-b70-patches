@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <functional>
+#include <limits>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -585,12 +587,78 @@ struct server_prompt {
     }
 };
 
+// [switchcost] switches (all default 0, read once):
+//   LLAMA_PCACHE_POOL=1   prompt-cache state buffers come from a pool of reused pinned (USM host) buffers instead of a
+//                         fresh zero-filled std::vector per save (=2: reused pageable buffers). Pool blocks count
+//                         against --cache-ram like the states themselves and are released first when room is needed.
+//   LLAMA_PCACHE_KEEP=1   the host copy of a state that is restored into a slot is kept (the "shadow"); the next save
+//                         of that slot copies every attention KV row that has not changed since the restore from the
+//                         shadow and reads only the rest from the device (=2: also reads the reused rows and aborts on
+//                         any difference). The shadow counts against --cache-ram and is dropped before any state.
+//   LLAMA_PCACHE_CKPT_MOVE=1  a save moves the slot's checkpoints into the cache entry instead of copying them when
+//                         the slot is about to drop them anyway: all of them when another state is restored right
+//                         after, else those past the common prefix with the new prompt.
+int server_pcache_env(const char * name);
+
+// [switchcost] host buffer of a prompt-cache state: a plain std::vector (default), or a block of the reuse pool
+struct server_state_buf {
+    server_state_buf() = default;
+    server_state_buf(const server_state_buf &) = delete;
+    server_state_buf & operator=(const server_state_buf &) = delete;
+    server_state_buf(server_state_buf && other) noexcept;
+    server_state_buf & operator=(server_state_buf && other) noexcept;
+    ~server_state_buf();
+
+    // allocate n bytes (contents undefined); false when the memory could not be allocated
+    bool alloc(size_t n);
+    // take a free pool block that holds n bytes; false when the pool is off or has none (nothing is allocated)
+    bool alloc_pooled(size_t n);
+    // free the memory (a pool block goes back to the pool)
+    void release();
+
+    uint8_t *       data()       { return ptr; }
+    const uint8_t * data() const { return ptr; }
+    size_t size()  const { return n; }
+    bool   empty() const { return n == 0; }
+    // host memory held
+    size_t mem()   const { return blk ? cap : vec.capacity(); }
+
+private:
+    std::vector<uint8_t> vec;
+    uint8_t * ptr = nullptr;
+    size_t    n   = 0;
+    size_t    cap = 0;
+    void    * blk = nullptr;
+};
+
+// [switchcost] free bytes held by the pool; release pool blocks until at least `n_bytes` are freed (returns freed)
+size_t server_pcache_pool_free();
+bool   server_pcache_pool_on();
+size_t server_pcache_block_size(size_t n);
+size_t server_pcache_pool_trim(size_t n_bytes);
+
+struct server_prompt_data;
+
+// [switchcost] LLAMA_PCACHE_KEEP=2: read the whole state of seq `id` from both contexts and compare it with `data`
+// (aborts on a difference)
+void server_pcache_verify_state(const char * what, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id,
+        const server_prompt_data & data);
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buf main;
+    server_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
+    }
+
+    size_t mem() const {
+        return main.mem() + drft.mem();
+    }
+
+    void release() {
+        main.release();
+        drft.release();
     }
 };
 
@@ -600,6 +668,17 @@ struct server_prompt_cache_state {
 
     size_t size() const {
         size_t res = data.size();
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+
+        return res;
+    }
+
+    // host memory held (== size() without the pool)
+    size_t mem() const {
+        size_t res = data.mem();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -623,7 +702,22 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // [switchcost] LLAMA_PCACHE_KEEP: the host copy of the state last restored into slot shadow_slot (see load())
+    server_prompt_data shadow;
+    int                shadow_slot = -1;
+
+    void shadow_drop() {
+        shadow.release();
+        shadow_slot = -1;
+    }
+
+    // host memory held by the cache: the states, the shadow and the free pool blocks
     size_t size() const;
+
+    // make room for n_new() more bytes: release free pool blocks, then the shadow, then the oldest states (never
+    // `keep`); on_freed() runs after the shadow drop / each eviction, before the pool is trimmed again
+    void make_room(const std::function<size_t()> & n_new, const server_prompt_cache_state * keep,
+            const std::function<void()> & on_freed);
 
     size_t n_tokens() const;
 
@@ -634,7 +728,9 @@ struct server_prompt_cache {
 
     // `keep` is a cached state that the caller is going to load() right after this call:
     // it is never evicted to make room and its size counts as reclaimable, since load() removes it from the cache
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_prompt_cache_state * keep = nullptr);
+    // [switchcost] checkpoints of `prompt` with pos_max > ckpt_move_pos are moved into the new entry instead of copied
+    // (default: copy all)
+    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_prompt_cache_state * keep = nullptr, llama_pos ckpt_move_pos = std::numeric_limits<llama_pos>::max());
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -2306,10 +2306,147 @@ static bool llama_kv_ckpt_partial_skip() {
     return v;
 }
 
+// [switchcost] LLAMA_PCACHE_KEEP: see llama_memory_i::ref_mark. Only a plain (non-SWA) single-stream cache takes part.
+void llama_kv_cache::ref_mark(llama_seq_id seq_id) {
+    ref_seq = -1;
+    ref_n   = 0;
+    ref_row.clear();
+
+    if (other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || swa_type != LLAMA_SWA_TYPE_NONE || n_stream != 1) {
+        return;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cells = v_cells[strm];
+
+    cells.touch_clear();
+
+    // the rows of a state are written in ascending cell order (state_write), so row r of the reference is the r-th
+    // cell of the sequence
+    ref_row.assign(cells.size(), -1);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+            ref_row[i] = (int32_t) ref_n++;
+        }
+    }
+
+    ref_seq  = seq_id;
+    ref_strm = strm;
+}
+
+// parse the attention part of a reference state (as written by state_write for ref_seq) starting at `off`
+bool llama_kv_cache::ref_parse(const uint8_t * ref, size_t ref_size, size_t off, ref_layout & rl) const {
+    size_t p = off;
+    auto rd = [&](void * dst, size_t n) -> bool {
+        if (p + n > ref_size) {
+            return false;
+        }
+        memcpy(dst, ref + p, n);
+        p += n;
+        return true;
+    };
+
+    uint32_t n_stream_ref = 0;
+    if (!rd(&n_stream_ref, sizeof(n_stream_ref)) || n_stream_ref != 1 || n_stream != 1) {
+        return false;
+    }
+
+    uint32_t cell_count = 0;
+    if (!rd(&cell_count, sizeof(cell_count)) || cell_count == 0 || cell_count != ref_n) {
+        return false;
+    }
+
+    rl.base = ref;
+    rl.pos.resize(cell_count);
+    for (uint32_t r = 0; r < cell_count; ++r) {
+        llama_pos pos;
+        uint32_t  n_seq_id;
+        if (!rd(&pos, sizeof(pos)) || !rd(&n_seq_id, sizeof(n_seq_id))) {
+            return false;
+        }
+        if (has_cell_ext()) {
+            p += sizeof(llama_kv_cell_ext);
+        }
+        p += (size_t) n_seq_id * sizeof(llama_seq_id);
+        if (p > ref_size) {
+            return false;
+        }
+        rl.pos[r] = pos;
+    }
+
+    uint32_t v_trans_ref = 0;
+    uint32_t n_layer_ref = 0;
+    if (!rd(&v_trans_ref, sizeof(v_trans_ref)) || !rd(&n_layer_ref, sizeof(n_layer_ref))) {
+        return false;
+    }
+    if (v_trans_ref != 0 || v_trans || n_layer_ref != layers.size()) {
+        return false;
+    }
+
+    rl.k_off.assign(layers.size(), SIZE_MAX);
+    rl.k_row.assign(layers.size(), 0);
+    rl.v_off.assign(layers.size(), SIZE_MAX);
+    rl.v_row.assign(layers.size(), 0);
+
+    for (size_t l = 0; l < layers.size(); ++l) {
+        int32_t  type;
+        uint64_t row;
+        if (!rd(&type, sizeof(type)) || !rd(&row, sizeof(row))) {
+            return false;
+        }
+        if (p + (size_t) cell_count * row > ref_size) {
+            return false;
+        }
+        const auto * k = layers[l].k_stream[ref_strm];
+        if (type == (int32_t) k->type && row == ggml_row_size(k->type, hparams.n_embd_k_gqa(layers[l].il))) {
+            rl.k_off[l] = p;
+            rl.k_row[l] = row;
+        }
+        p += (size_t) cell_count * row;
+    }
+
+    for (size_t l = 0; l < layers.size(); ++l) {
+        const auto * v = layers[l].v_stream[ref_strm];
+        if (!v) {
+            continue;
+        }
+        int32_t  type;
+        uint64_t row;
+        if (!rd(&type, sizeof(type)) || !rd(&row, sizeof(row))) {
+            return false;
+        }
+        if (p + (size_t) cell_count * row > ref_size) {
+            return false;
+        }
+        if (type == (int32_t) v->type && row == ggml_row_size(v->type, hparams.n_embd_v_gqa(layers[l].il))) {
+            rl.v_off[l] = p;
+            rl.v_row[l] = row;
+        }
+        p += (size_t) cell_count * row;
+    }
+
+    return true;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+
+    // [switchcost] a reference state of the same sequence, see ref_mark(); the attention part of a state starts at the
+    // same offset in the reference as here (right after the fixed 8-byte sequence header)
+    ref_layout rl;
+    bool use_ref = false;
+    {
+        size_t ref_size = 0;
+        const uint8_t * ref = io.get_ref(ref_size);
+        if (ref && seq_id >= 0 && seq_id == ref_seq && flags == LLAMA_STATE_SEQ_FLAGS_NONE && io.n_bytes() == 8) {
+            use_ref = ref_parse(ref, ref_size, io.n_bytes(), rl);
+            if (!use_ref) {
+                LLAMA_LOG_WARN("%s: [pcache] reference state does not match the cache layout - writing the full state\n", __func__);
+            }
+        }
     }
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2380,7 +2517,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         }
 
         state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
+        state_write_data(io, cr, use_ref && s == ref_strm ? &rl : nullptr);
     }
 }
 
@@ -2497,7 +2634,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, const ref_layout * rl) const {
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
@@ -2505,6 +2642,50 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
+
+    // [switchcost] runs of cells in write order: {first cell, count, reference row of the first cell or -1}. A cell is
+    // taken from the reference when it was in the reference at mark time, has not been touched since and still has
+    // the position it had there.
+    struct run_t { uint32_t c0; uint32_t n; int64_t r0; };
+    std::vector<run_t> runs;
+    if (rl) {
+        for (const auto & range : cr.data) {
+            for (uint32_t i = range.first; i < range.second; ++i) {
+                int64_t r = -1;
+                if (i < ref_row.size() && ref_row[i] >= 0 && !cells.is_touched(i) &&
+                    rl->pos[ref_row[i]] == cells.pos_get(i)) {
+                    r = ref_row[i];
+                }
+                if (!runs.empty()) {
+                    auto & b = runs.back();
+                    const bool cont_cell = b.c0 + b.n == i;
+                    const bool cont_ref  = (b.r0 < 0 && r < 0) || (b.r0 >= 0 && r == b.r0 + b.n);
+                    if (cont_cell && cont_ref) {
+                        b.n++;
+                        continue;
+                    }
+                }
+                runs.push_back({ i, 1, r });
+            }
+        }
+    }
+
+    auto write_rows = [&](ggml_tensor * t, uint64_t size_row, size_t ref_off) {
+        if (!rl || ref_off == SIZE_MAX) {
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                io.write_tensor(t, range.first * size_row, range_size * size_row);
+            }
+            return;
+        }
+        for (const auto & run : runs) {
+            if (run.r0 >= 0) {
+                io.write_ref(rl->base + ref_off + (size_t) run.r0 * size_row, t, (size_t) run.c0 * size_row, (size_t) run.n * size_row);
+            } else {
+                io.write_tensor(t, (size_t) run.c0 * size_row, (size_t) run.n * size_row);
+            }
+        }
+    };
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
@@ -2524,11 +2705,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         io.write(&k_size_row, sizeof(k_size_row));
 
         // Read each range of cells of k_size length and write out
-        for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
-        }
+        write_rows(k, k_size_row, rl ? rl->k_off[&layer - layers.data()] : SIZE_MAX);
     }
 
     if (!v_trans) {
@@ -2551,11 +2728,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             io.write(&v_size_row, sizeof(v_size_row));
 
             // Read each range of cells of v_size length and write out
-            for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
-            }
+            write_rows(v, v_size_row, rl ? rl->v_off[&layer - layers.data()] : SIZE_MAX);
         }
     } else {
         // When v is transposed, we also need the element size and get the element ranges from each row

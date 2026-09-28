@@ -946,6 +946,7 @@ server_tokens process_mtmd_prompt(
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
+    const int64_t sw0 = ggml_time_us(); // [switchcost]
     for (auto & file : files) {
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
         if (!out.bitmap) {
@@ -967,6 +968,7 @@ server_tokens process_mtmd_prompt(
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     auto bitmaps_c_ptr = bitmaps.c_ptr();
+    const int64_t sw1 = ggml_time_us();
     int32_t tokenized = mtmd_tokenize(mctx,
                                       chunks.ptr.get(),
                                       &inp_txt,
@@ -974,6 +976,10 @@ server_tokens process_mtmd_prompt(
                                       bitmaps_c_ptr.size());
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
+    }
+    if (common_swp_on()) {
+        common_swp("mtmd prompt: %zu file(s) decode+hash %.1f ms, mtmd_tokenize (text + image preprocess) %.1f ms",
+                files.size(), (sw1 - sw0) / 1000.0, (ggml_time_us() - sw1) / 1000.0);
     }
     auto result = server_tokens(chunks, true);
     return result;
