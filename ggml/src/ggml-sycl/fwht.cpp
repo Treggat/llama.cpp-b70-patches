@@ -240,7 +240,7 @@ static void launch_kronecker(const float *   src,
                          });
 }
 
-bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+bool ggml_sycl_fwht_supported(const ggml_tensor * src, const ggml_tensor * dst) {
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -248,6 +248,18 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         return false;
     }
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    switch (src->ne[0]) {
+        case 64: case 128: case 256: case 512: case 384: case 768: case 640: case 1280:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_sycl_fwht_supported(src, dst)) {
         return false;
     }
 

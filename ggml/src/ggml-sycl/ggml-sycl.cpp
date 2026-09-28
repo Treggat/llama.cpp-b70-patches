@@ -7025,6 +7025,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 //                                 or re-allocate (same graph uid, node array, node count, no weight reorder and no
 //                                 device free since) instead of hashing all nodes again; 2: also hash and abort on
 //                                 any difference (test mode)
+//   GGML_SYCL_GRAPH_ROT_ROWS=0    [draftreplay] 1: the MAX_TOKENS test ignores the Hadamard-rotation MUL_MATs of a
+//                                 quantized KV cache (llama_mul_mat_hadamard, GGML_HINT_SRC0_IS_HADAMARD) that the FWHT
+//                                 kernel serves: their rows are n_tokens * n_head * (head_dim / 64), not tokens, so a
+//                                 1-token MTP draft with a q8_0 draft KV (24 heads) counted 96 rows and never replayed.
+//                                 The weight MUL_MATs and FLASH_ATTN_EXT still see the real token count.
 //   GGML_SYCL_GRAPH_SELFTEST=1    test hook: eager run, poison node outputs with 0xFF, record, replay
 //                                 (so test-backend-ops compares the REPLAYED result against the CPU);
 //                                 =2 is the harness's negative control (records but never replays)
@@ -7040,6 +7045,7 @@ struct ggml_sycl_graph_cfg {
     int selftest  = 0;
     int record_ahead = 0; // [hostv]
     int sig_memo     = 0; // [hostv]
+    int rot_rows     = 0; // [draftreplay]
 };
 
 static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
@@ -7054,9 +7060,11 @@ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
         c.selftest  = ggml_sycl_get_env("GGML_SYCL_GRAPH_SELFTEST", 0);
         c.record_ahead = ggml_sycl_get_env("GGML_SYCL_GRAPH_RECORD_AHEAD", 0);
         c.sig_memo     = ggml_sycl_get_env("GGML_SYCL_GRAPH_SIG_MEMO", 0);
+        c.rot_rows     = ggml_sycl_get_env("GGML_SYCL_GRAPH_ROT_ROWS", 0);
         if (g_ggml_sycl_enable_graph) {
-            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d\n",
-                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo);
+            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d rot_rows=%d\n",
+                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo,
+                          c.rot_rows);
         }
         return c;
     }();
@@ -7119,6 +7127,8 @@ static double   g_gstat_sig_us = 0;
 static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
 static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
 static uint64_t g_gstat_record_ahead = 0, g_gstat_record_ahead_fail = 0, g_gstat_memo_hit = 0, g_gstat_memo_checked = 0; // [hostv]
+static uint64_t g_gstat_too_big = 0, g_gstat_incompat = 0; // [draftreplay]
+static std::map<std::string, uint64_t> g_gstat_too_big_reason;
 
 // ---- [spechost] GGML_SYCL_GRAPH_MISSLOG=N: explain why a graph got a NEW cache signature (eager/record instead of
 // replay). For every new signature it compares the graph node by node with the previous graph of the same shape class
@@ -7259,6 +7269,11 @@ static void ggml_sycl_graph_stats_print() {
                 (unsigned long long) g_gstat_record_ahead, (unsigned long long) g_gstat_record_ahead_fail,
                 (unsigned long long) g_gstat_memo_hit, (unsigned long long) g_gstat_memo_checked);
     }
+    fprintf(stderr, "[SYCL-GRAPH] draftreplay: too_big=%llu incompatible(not in calls)=%llu\n",
+            (unsigned long long) g_gstat_too_big, (unsigned long long) g_gstat_incompat);
+    for (auto & kv : g_gstat_too_big_reason) {
+        fprintf(stderr, "[SYCL-GRAPH]   too_big %8llu  %s\n", (unsigned long long) kv.second, kv.first.c_str());
+    }
     fprintf(stderr, "[SYCL-GRAPH] host ms/call: eager=%.3f record=%.3f finalize=%.3f replay=%.3f\n",
                   g_gstat_n_eager_timed ? g_gstat_t_eager_us / g_gstat_n_eager_timed / 1e3 : 0.0,
                   g_gstat_record ? g_gstat_t_record_us / g_gstat_record / 1e3 : 0.0,
@@ -7396,6 +7411,23 @@ static std::unique_ptr<ggml_sycl_exec_graph_t> ggml_sycl_graph_record(ggml_backe
     }
 }
 
+// rows a node contributes to the GGML_SYCL_GRAPH_MAX_TOKENS test (-1: none)
+static int64_t ggml_sycl_graph_node_rows(const ggml_tensor * node, const ggml_sycl_graph_cfg & cfg) {
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1]) {
+        // [draftreplay] GGML_SYCL_GRAPH_ROT_ROWS: a KV-rotation MUL_MAT that ggml_sycl_mul_mat() hands to the FWHT kernel
+        // (one elementwise-style kernel per call, no host work) does not decide whether the graph is a prefill graph
+        if (cfg.rot_rows > 0 && node->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_sycl_fwht_supported(node->src[1], node)) {
+            return -1;
+        }
+        return node->src[1]->ne[1];
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return node->src[0]->ne[1];
+    }
+    return -1;
+}
+
 static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
     const ggml_sycl_graph_cfg & cfg = ggml_sycl_graph_config();
 
@@ -7411,15 +7443,29 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
 
     bool too_big = cgraph->n_nodes < cfg.min_nodes;
     for (int i = 0; i < cgraph->n_nodes && !too_big; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1]) {
-            too_big = node->src[1]->ne[1] > cfg.max_tokens;
-        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            too_big = node->src[0]->ne[1] > cfg.max_tokens;
-        }
+        too_big = ggml_sycl_graph_node_rows(cgraph->nodes[i], cfg) > cfg.max_tokens;
     }
     if (too_big) {
         g_gstat_eager++;
+        if (cfg.stats > 0) {  // [draftreplay] which node made the graph run eagerly
+            g_gstat_too_big++;
+            std::string why = "min_nodes";
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                const int64_t nt = ggml_sycl_graph_node_rows(node, cfg);
+                if (nt > cfg.max_tokens) {
+                    why = std::string(cgraph->n_nodes >= 1000 ? "big " : "small ") + ggml_op_name(node->op) + " @" +
+                          ggml_sycl_gmiss_fold(node->name) + " rows=" + std::to_string(nt) +
+                          " src0=" + ggml_sycl_gmiss_fold(node->src[0]->name) + "[" + std::to_string(node->src[0]->ne[0]) + "," +
+                          std::to_string(node->src[0]->ne[1]) + "," + std::to_string(node->src[0]->ne[2]) + "] src1=" +
+                          (node->src[1] ? ggml_sycl_gmiss_fold(node->src[1]->name) + "[" + std::to_string(node->src[1]->ne[0]) + "," +
+                           std::to_string(node->src[1]->ne[1]) + "," + std::to_string(node->src[1]->ne[2]) + "]" : std::string("-")) +
+                          " n_nodes=" + std::to_string(cgraph->n_nodes);
+                    break;
+                }
+            }
+            g_gstat_too_big_reason[why]++;
+        }
         ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
         return;
     }
@@ -7553,6 +7599,9 @@ static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend,
     bool use_sycl_graph = false;
     if (g_ggml_sycl_enable_graph) {
         use_sycl_graph = check_graph_compatibility(cgraph);
+        if (!use_sycl_graph) {
+            g_gstat_incompat++;  // [draftreplay]
+        }
     }
     if (use_sycl_graph) {
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);

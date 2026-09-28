@@ -14,6 +14,8 @@
 // (the other envs) can be compared against each other.
 //
 // usage: test-hostv-reuse [steps=400] [multi_b=1] [n_layer=64] [n_ctx=4096] [seed=1] [n_vocab=4096] [mtp=1] [n_prompt=300]
+// [draftreplay] env HOSTV_DFT_KV=q8_0: quantized MTP draft KV (server -ctkd/-ctvd q8_0; turns on the KV Hadamard rotation);
+//   env HOSTV_N_HEAD=24 HOSTV_N_HEAD_KV=4: attention heads of dim 256 as in the house model (default 2 / 1 heads of 128)
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -65,7 +67,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
-    const uint32_t n_embd = 256, n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head;
+    const uint32_t n_embd = 256, n_head = 2, n_ff = 384;
+    const uint32_t n_head_attn = getenv("HOSTV_N_HEAD") ? atoi(getenv("HOSTV_N_HEAD")) : 0;
+    const uint32_t n_head_kv   = getenv("HOSTV_N_HEAD_KV") ? atoi(getenv("HOSTV_N_HEAD_KV")) : 1;
+    const uint32_t n_embd_head = n_head_attn > 0 ? 256 : n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
@@ -77,8 +82,15 @@ static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp
     }
     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
+    if (n_head_attn > 0) {
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head_attn);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  n_embd_head);
+    } else {
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
@@ -184,6 +196,10 @@ int main(int argc, char ** argv) {
         if (mtp) {
             cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cp.n_rs_seq = 0;
+            if (getenv("HOSTV_DFT_KV") && std::string(getenv("HOSTV_DFT_KV")) == "q8_0") {
+                cp.type_k = GGML_TYPE_Q8_0;
+                cp.type_v = GGML_TYPE_Q8_0;
+            }
             p.dft.reset(llama_init_from_model(model.get(), cp));
             GGML_ASSERT(p.dft);
             llama_set_embeddings_nextn(p.tgt.get(), true, false);

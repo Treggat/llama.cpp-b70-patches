@@ -8,7 +8,9 @@
 //   catch-up decode of the "accepted" tokens, as in the server loop. Only the draft context is used.
 //
 // usage: test-draftcost-host [steps=300] [n_ctx=65536] [n_prompt=60000] [n_vocab=4096] [backend_sampling=1]
-//                            [n_draft=5] [kv=f16|q8_0|cmp] [n_embd=512] [seed=1] [role=dft|tgt]
+//                            [n_draft=5] [kv=f16|q8_0|cmp] [n_embd=512] [seed=1] [role=dft|tgt] [n_head=0] [n_head_kv=1]
+//   n_head > 0 [draftreplay]: attention with n_head query / n_head_kv KV heads of dim 256 (the house model is 24 / 4),
+//   independent of n_embd; 0 keeps the original layout (2 heads of n_embd/2, 1 KV head)
 //   kv=cmp runs an f16-KV and a q8_0-KV draft context side by side on the same inputs and reports the max abs
 //   difference of the h_nextn rows and the top-1 agreement of the draft candidates.
 #include "common.h"
@@ -53,10 +55,11 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     }
 }
 
-static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t n_embd) {
+static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t n_embd, uint32_t n_head_attn = 0, uint32_t n_head_kv = 1) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
-    const uint32_t n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head; // head dim 256 at n_embd 512 (XMX FA)
+    const uint32_t n_head = 2, n_ff = 384; // n_head: GDN time-step rank and (n_head_attn == 0) the attention heads
+    const uint32_t n_embd_head = n_head_attn > 0 ? 256 : n_embd / n_head; // head dim 256 at n_embd 512 (XMX FA)
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
@@ -66,8 +69,15 @@ static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t
     ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,        uint32_t(1));
     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
+    if (n_head_attn > 0) {
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head_attn);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  n_embd_head);
+    } else {
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
@@ -199,6 +209,8 @@ int main(int argc, char ** argv) {
     const std::string kv       = argc > 7 ? argv[7] : "f16";
     const uint32_t    n_embd   = argc > 8 ? atoi(argv[8]) : 512;
     const size_t      seed     = argc > 9 ? atoll(argv[9]) : 1;
+    const uint32_t    n_head_a = argc > 11 ? atoi(argv[11]) : 0;
+    const uint32_t    n_head_k = argc > 12 ? atoi(argv[12]) : 1;
 
     llama_backend_init();
 
@@ -212,10 +224,11 @@ int main(int argc, char ** argv) {
     if (!dev) {
         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
-    fprintf(stderr, "device: %s steps=%d n_ctx=%u n_prompt=%d n_vocab=%u backend_sampling=%d n_draft=%d kv=%s n_embd=%u\n",
-            ggml_backend_dev_description(dev), steps, n_ctx, n_prompt, n_vocab, (int) bsamp, n_draft, kv.c_str(), n_embd);
+    fprintf(stderr, "device: %s steps=%d n_ctx=%u n_prompt=%d n_vocab=%u backend_sampling=%d n_draft=%d kv=%s n_embd=%u n_head=%u n_head_kv=%u\n",
+            ggml_backend_dev_description(dev), steps, n_ctx, n_prompt, n_vocab, (int) bsamp, n_draft, kv.c_str(), n_embd,
+            n_head_a, n_head_k);
 
-    auto gguf = make_qwen35(4, n_vocab, n_embd);
+    auto gguf = make_qwen35(4, n_vocab, n_embd, n_head_a, n_head_k);
     llama_model_params mp = llama_model_default_params();
     std::vector<ggml_backend_dev_t> devs = { dev, nullptr };
     mp.devices  = devs.data();
