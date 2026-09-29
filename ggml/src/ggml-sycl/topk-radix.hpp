@@ -22,3 +22,10 @@ void ggml_sycl_top_k_radix(
     const int64_t   nrows,
     const int       k,
     dpct::queue_ptr main_stream);
+
+
+// LOCAL (verifystep) GGML_SYCL_TOPK_BATCH: the split-row radix select for nrows (<= 16) consecutive rows of src with
+// row r's k indices written to dsts[r] (the backend sampler's per-row TOP_K nodes, launched once). Returns false when
+// the shape would not take the split kernel (then nothing is launched).
+bool ggml_sycl_top_k_radix_rows(ggml_backend_sycl_context & ctx, const float * src, int32_t * const * dsts, int64_t ncols,
+                                int nrows, int k, dpct::queue_ptr main_stream);

@@ -16,6 +16,9 @@
 // usage: test-hostv-reuse [steps=400] [multi_b=1] [n_layer=64] [n_ctx=4096] [seed=1] [n_vocab=4096] [mtp=1] [n_prompt=300]
 // [draftreplay] env HOSTV_DFT_KV=q8_0: quantized MTP draft KV (server -ctkd/-ctvd q8_0; turns on the KV Hadamard rotation);
 //   env HOSTV_N_HEAD=24 HOSTV_N_HEAD_KV=4: attention heads of dim 256 as in the house model (default 2 / 1 heads of 128)
+// [verifystep] env HOSTV_N_EMBD / HOSTV_N_FF: model width / FFN size (default 256 / 384); HOSTV_QTYPE=q4_K: every 2D
+//   weight whose rows are a multiple of 256 is q4_K (output.weight q8_0), filled with quantized random values, so the
+//   quantized SYCL paths (XMX q4_K, split-K small rows, fusions) run; the model is built twice (pass 1 lists the shapes)
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -44,6 +47,9 @@ static void set_env(const char * k, const char * v) { _putenv_s(k, v); }
 static void set_env(const char * k, const char * v) { setenv(k, v, 1); }
 #endif
 
+struct hostv_tinfo { std::string name; int64_t ne[4]; };
+static std::vector<hostv_tinfo> g_hostv_seen;   // [verifystep] pass 1 of HOSTV_QTYPE
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const size_t seed0 = *(const size_t *) userdata;
     std::hash<std::string> hasher;
@@ -51,7 +57,14 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     std::normal_distribution<float> dis(0.0f, 0.1f);
     const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
     const int64_t ne = ggml_nelements(tensor);
-    if (tensor->type == GGML_TYPE_F32) {
+    g_hostv_seen.push_back({ tensor->name, { tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3] } });
+    if (ggml_is_quantized(tensor->type)) {   // [verifystep] HOSTV_QTYPE
+        std::vector<float> tmp(ne);
+        for (auto & v : tmp) { v = dis(gen); }
+        std::vector<uint8_t> q(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
+    } else if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> tmp(ne);
         for (auto & v : tmp) { const float x = dis(gen); v = is_ssm_a ? -fabsf(x) : x; }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
@@ -67,7 +80,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
-    const uint32_t n_embd = 256, n_head = 2, n_ff = 384;
+    const uint32_t n_embd = getenv("HOSTV_N_EMBD") ? atoi(getenv("HOSTV_N_EMBD")) : 256, n_head = 2;
+    const uint32_t n_ff   = getenv("HOSTV_N_FF") ? atoi(getenv("HOSTV_N_FF")) : 384;
     const uint32_t n_head_attn = getenv("HOSTV_N_HEAD") ? atoi(getenv("HOSTV_N_HEAD")) : 0;
     const uint32_t n_head_kv   = getenv("HOSTV_N_HEAD_KV") ? atoi(getenv("HOSTV_N_HEAD_KV")) : 1;
     const uint32_t n_embd_head = n_head_attn > 0 ? 256 : n_embd / n_head;
@@ -171,6 +185,36 @@ int main(int argc, char ** argv) {
     mp.devices = devs.data();
     mp.load_mtp = mtp;
     size_t wseed = seed;
+    const char * qtype_env = getenv("HOSTV_QTYPE");
+    if (qtype_env && std::string(qtype_env) == "q4_K") {   // [verifystep] pass 1: list the tensors, then declare their types
+        {
+            llama_model_ptr m0(llama_model_init_from_user(gguf.get(), set_tensor_data, &wseed, mp));
+            GGML_ASSERT(m0);
+        }
+        int n_q = 0;
+        for (const auto & ti : g_hostv_seen) {
+            const bool two_d = ti.ne[1] > 1 && ti.ne[2] == 1 && ti.ne[3] == 1;
+            const bool is_out = ti.name == "output.weight";
+            const ggml_type t = is_out ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_K;
+            if (!two_d || ti.ne[0] % 256 != 0 || ti.name.find(".weight") == std::string::npos || ti.name.find("norm") != std::string::npos ||
+                gguf_find_tensor(gguf.get(), ti.name.c_str()) != -1) {
+                continue;
+            }
+            ggml_tensor tt;
+            memset(&tt, 0, sizeof(tt));
+            tt.type = t;
+            for (int d = 0; d < 4; d++) { tt.ne[d] = ti.ne[d]; }
+            tt.nb[0] = ggml_type_size(t);
+            tt.nb[1] = tt.nb[0] * (tt.ne[0] / ggml_blck_size(t));
+            tt.nb[2] = tt.nb[1] * tt.ne[1];
+            tt.nb[3] = tt.nb[2] * tt.ne[2];
+            ggml_set_name(&tt, ti.name.c_str());
+            gguf_add_tensor(gguf.get(), &tt);
+            n_q++;
+        }
+        fprintf(stderr, "HOSTV_QTYPE q4_K: %d quantized weights\n", n_q);
+        g_hostv_seen.clear();
+    }
     llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &wseed, mp));
     if (!model) {
         fprintf(stderr, "failed to create model\n");

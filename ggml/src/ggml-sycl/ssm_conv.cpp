@@ -359,3 +359,65 @@ void ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
     ggml_sycl_op_ssm_conv(ctx, dst, silu_dst, bias);
 }
+
+// ---- LOCAL (verifystep) GGML_SYCL_CONV_STEP ----
+void ggml_sycl_conv_step(ggml_backend_sycl_context & ctx, const char * cs, int64_t cs_nb0, int64_t cs_nb1, const char * qx,
+                         int64_t q_nb0, int64_t q_nb1, float * ci, int C, int n_t, const ggml_sycl_conv_step_snap & snap,
+                         int n_snap, const float * w, float * conv_out) {
+    GGML_ASSERT(n_t >= 1 && n_t <= 16 && n_snap >= 0 && n_snap <= 16);
+    constexpr int DC  = 4;
+    constexpr int CPG = 16;          // channels per work-group
+    constexpr int SL  = 16;          // work-items per channel
+    constexpr int RS  = DC - 1 + 16 + 1;   // SLM row stride (floats)
+    const int ncs = DC - 1 + n_t;    // conv_input row length
+    const ggml_sycl_conv_step_snap sn = snap;
+    const int ngroups = (C + CPG - 1) / CPG;
+    ctx.stream()->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> tile(sycl::range<1>(CPG * RS), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ngroups * CPG * SL), sycl::range<1>(CPG * SL)), [=](sycl::nd_item<1> it) {
+            const int lid = (int) it.get_local_id(0);
+            const int chl = lid / SL, j = lid % SL;
+            const int c   = (int) it.get_group(0) * CPG + chl;
+            float * srow  = &tile[chl * RS];
+            // 1. conv_input row: element k = conv state k (k < 3) or new column k - 3; to global and to SLM
+            if (c < C) {
+#pragma unroll
+                for (int k0 = 0; k0 < DC - 1 + 16; k0 += SL) {
+                    const int k = k0 + j;
+                    if (k < ncs) {
+                        const float v = k < DC - 1 ? *(const float *) (cs + k * cs_nb0 + (int64_t) c * cs_nb1)
+                                                   : *(const float *) (qx + (k - (DC - 1)) * q_nb0 + (int64_t) c * q_nb1);
+                        ci[(int64_t) c * ncs + k] = v;
+                        srow[k] = v;
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (c >= C) {
+                return;
+            }
+            // 2. snapshots: element e = 3 * slot + i0 of this channel
+#pragma unroll
+            for (int e0 = 0; e0 < 3 * 16; e0 += SL) {
+                const int e = e0 + j;
+                if (e < 3 * n_snap) {
+                    const int sl = e / (DC - 1), i0 = e % (DC - 1);
+                    float * d = sn.dst[0];
+                    int     o = sn.off[0];
+#pragma unroll
+                    for (int q = 1; q < 16; ++q) {
+                        if (sl == q) {
+                            d = sn.dst[q];
+                            o = sn.off[q];
+                        }
+                    }
+                    d[(int64_t) c * (DC - 1) + i0] = srow[o + i0];
+                }
+            }
+            // 3. token j: the unfused SSM_CONV + SiLU element (ssm_conv_element<4>), its row read from SLM
+            if (conv_out != nullptr && j < n_t) {
+                ssm_conv_element<DC>((size_t) j, srow, w + (int64_t) c * DC, conv_out + c, DC, 1, n_t, ncs, 0, C, 0, true, nullptr);
+            }
+        });
+    });
+}

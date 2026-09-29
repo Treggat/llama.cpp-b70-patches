@@ -203,6 +203,187 @@ sycl::event ggml_sycl_xmx_q4k_direct_launch(const uint8_t * dQs, const uint8_t *
     });
 }
 
+// ---- LOCAL (verifystep): gate + up in one launch (GGML_SYCL_XMX_GATEUP) ----
+// Two q4_K weights of the same shape (ffn_gate, ffn_up) against ONE quantized activation. A work-group is 2*ks
+// sub-groups on the same 16 rows: sub-groups 0..ks-1 run the gate weight's split-K parts, ks..2ks-1 the up weight's,
+// each with exactly the per-sub-group code and block partition of ggml_sycl_xmx_q4k_direct_launch at the same ks, and
+// each half is reduced in SLM in the same order (part 0 + part 1 + ...), so the gate and up values are bit-identical to
+// two separate direct launches. GLU = false: gate -> outG, up -> outU (the GLU op then runs as before). GLU = true:
+// out = silu(gate) * up, computed as the SYCL GLU kernel does (op_silu(x) = x / (1 + exp(-x)), then * up), written to
+// outG; the gate / up intermediates are never stored (bit-identity with the separate GLU launch is checked by the
+// caller's GGML_SYCL_XMX_GATEUP_CHECK, since it depends on the compiler treating both expressions alike).
+template <bool GLU>
+static sycl::event xd_q4k_pair(const uint8_t * gQs, const uint8_t * gSc, const uint32_t * gDm, const uint8_t * uQs,
+                               const uint8_t * uSc, const uint32_t * uDm, const int8_t * dXa, const sycl::half * dD8c,
+                               const int32_t * dS8c, float * outG, float * outU, int N, int K, int M, int64_t ldd, int ks,
+                               sycl::queue & q) {
+    const int KB = K / QK_K, G = K / QK8_1;
+    return q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(2 * ks * 8 * 16), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * 2 * ks * 16), sycl::range<1>(2 * ks * 16)),
+                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            using sycl::access::address_space;
+            using sycl::access::decorated;
+            sycl::sub_group sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int sgi  = sg.get_group_id()[0];
+            const int half = sgi >= ks ? 1 : 0;       // 0: gate, 1: up
+            const int s    = sgi - half * ks;         // split-K part of this weight
+            const int row0 = (int) it.get_group(0) * 16;
+            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
+            const int row  = row0 + lane;
+            const uint8_t *  dQs = half ? uQs : gQs;
+            const uint8_t *  dSc = half ? uSc : gSc;
+            const uint32_t * dDm = half ? uDm : gDm;
+            const uint8_t *  qrow = dQs + (size_t) row * (K / 2);
+            const uint32_t * hsc  = reinterpret_cast<const uint32_t *>(dSc + (size_t) row * KB * 12);
+            const uint32_t * hdm  = dDm + (size_t) row * KB;
+            const sycl::uint4 * d8base = reinterpret_cast<const sycl::uint4 *>(dD8c + (size_t) lane * G);
+            const sycl::int4 *  s8base = reinterpret_cast<const sycl::int4 *>(dS8c + (size_t) lane * G);
+            const uint16_t *    xa16   = reinterpret_cast<const uint16_t *>(dXa);
+
+            sycl::uint4 w[8], wn[8];
+            {
+                const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) b0 * 128);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w[j] = pp[j]; }
+            }
+            uint32_t hw0 = hsc[b0 * 3 + 0], hw1 = hsc[b0 * 3 + 1], hw2 = hsc[b0 * 3 + 2], hwd = hdm[b0];
+            float F[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { F[i] = 0.f; }
+            for (int b = b0; b < b1; ++b) {
+                float rsd[8], rw[8];
+                {
+                    const uint32_t sc03 = hw0 & 0x3F3F3F3Fu, mn03 = hw1 & 0x3F3F3F3Fu;
+                    const uint32_t sc47 = (hw2 & 0x0F0F0F0Fu) | ((hw0 >> 2) & 0x30303030u);
+                    const uint32_t mn47 = ((hw2 >> 4) & 0x0F0F0F0Fu) | ((hw1 >> 2) & 0x30303030u);
+                    const float d    = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd & 0xFFFF));
+                    const float dmin = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd >> 16));
+                    const float d16  = d * 0.0625f, d8x = 8.f * d;
+#pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        const float sc = (float) (uint8_t) ((g < 4 ? sc03 : sc47) >> (8 * (g & 3)));
+                        const float mn = (float) (uint8_t) ((g < 4 ? mn03 : mn47) >> (8 * (g & 3)));
+                        rw[g]  = d8x * sc - dmin * mn;
+                        rsd[g] = d16 * sc;
+                    }
+                }
+                float d8c[8], tc[8];
+                {
+                    const sycl::uint4 dh = d8base[b];
+                    const sycl::int4  sa = s8base[b * 2], sb = s8base[b * 2 + 1];
+                    const uint32_t    dw[4] = { dh.x(), dh.y(), dh.z(), dh.w() };
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        d8c[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] & 0xFFFF));
+                        d8c[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] >> 16));
+                    }
+                    tc[0] = d8c[0] * (float) sa.x(); tc[1] = d8c[1] * (float) sa.y(); tc[2] = d8c[2] * (float) sa.z(); tc[3] = d8c[3] * (float) sa.w();
+                    tc[4] = d8c[4] * (float) sb.x(); tc[5] = d8c[5] * (float) sb.y(); tc[6] = d8c[6] * (float) sb.z(); tc[7] = d8c[7] * (float) sb.w();
+                }
+                {
+                    const int bn = b + 1 < b1 ? b + 1 : b;
+                    hw0 = hsc[bn * 3 + 0]; hw1 = hsc[bn * 3 + 1]; hw2 = hsc[bn * 3 + 2]; hwd = hdm[bn];
+                    const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) bn * 128);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { wn[j] = pp[j]; }
+                }
+                xd_v8s16 A[8];
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
+                        xa16 + (size_t) (b * 8 + g) * 256));
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) { A[g][m] = (short) av[m]; }
+                }
+                float Fb[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { Fb[i] = 0.f; }
+                xd_unroll(std::make_integer_sequence<int, 8>{}, [&](auto gi) {
+                    constexpr int g  = decltype(gi)::value;
+                    constexpr int ch = g >> 1;
+                    const sycl::uint4 w0 = w[2 * ch], w1 = w[2 * ch + 1];
+                    auto cv = [](uint32_t x) -> int {
+                        return (int) ((g & 1) ? ((x & 0xF0F0F0F0u) ^ 0x80808080u) : (((x << 4) & 0xF0F0F0F0u) ^ 0x80808080u));
+                    };
+                    const xd_v8i32 B = { cv(w0.x()), cv(w0.y()), cv(w0.z()), cv(w0.w()),
+                                         cv(w1.x()), cv(w1.y()), cv(w1.z()), cv(w1.w()) };
+                    const xd_v8i32 z   = 0;
+                    const xd_v8i32 acc = intel_sub_group_i8_i8_matrix_mad_k32(A[g], B, z);
+                    float sbv[8], tbv[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        sbv[i] = rsd[g] * sycl::select_from_group(sg, d8c[g], i);
+                        tbv[i] = sycl::select_from_group(sg, tc[g], i);
+                    }
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        Fb[i] = sycl::fma((float) acc[i], sbv[i], Fb[i]);
+                        Fb[i] = sycl::fma(tbv[i], rw[g], Fb[i]);
+                    }
+                });
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { F[i] += Fb[i]; }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w[j] = wn[j]; }
+            }
+            // per-half split-K reduction, the single kernel's order; ks == 1 keeps F as is (no SLM round trip there)
+            if (ks > 1 || GLU) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { red[(sgi * 8 + i) * 16 + lane] = F[i]; }
+                sycl::group_barrier(it.get_group());
+            }
+            if (ks > 1 && s == 0) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float acc = red[((half * ks) * 8 + i) * 16 + lane];
+                    for (int t = 1; t < ks; ++t) { acc += red[((half * ks + t) * 8 + i) * 16 + lane]; }
+                    F[i] = acc;
+                }
+            }
+            if constexpr (GLU) {
+                // the up half's reducer hands its sums to the gate half's reducer through SLM
+                if (ks > 1) {
+                    sycl::group_barrier(it.get_group());
+                    if (half == 1 && s == 0) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { red[(ks * 8 + i) * 16 + lane] = F[i]; }
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+                if (half == 0 && s == 0) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < M) {
+                            const float gv = F[i];
+                            const float uv = red[(ks * 8 + i) * 16 + lane];
+                            const float sv = gv / (1.0f + sycl::exp(-gv));
+                            outG[(size_t) i * ldd + row] = sv * uv;
+                        }
+                    }
+                }
+            } else {
+                if (s == 0) {
+                    float * o = half ? outU : outG;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { if (i < M) { o[(size_t) i * ldd + row] = F[i]; } }
+                }
+            }
+        });
+    });
+}
+
+sycl::event ggml_sycl_xmx_q4k_direct_pair_launch(const uint8_t * gQs, const uint8_t * gSc, const uint32_t * gDm,
+                                                 const uint8_t * uQs, const uint8_t * uSc, const uint32_t * uDm,
+                                                 const int8_t * xa, const sycl::half * d8, const int32_t * us, float * outG,
+                                                 float * outU, int N, int K, int M, int64_t ldd, int ks, bool glu,
+                                                 sycl::queue & q) {
+    return glu ? xd_q4k_pair<true>(gQs, gSc, gDm, uQs, uSc, uDm, xa, d8, us, outG, outU, N, K, M, ldd, ks, q) :
+                 xd_q4k_pair<false>(gQs, gSc, gDm, uQs, uSc, uDm, xa, d8, us, outG, outU, N, K, M, ldd, ks, q);
+}
+
 // q6_K: ql [N*KB][128], qh [N*KB][64], sc [N*KB][16] int8, dd [N*KB] half (the q6_K reorder layout, read in place)
 // xa: [G][2][8][32] int8 (tile 0: elements 0..15 of the group then zeros, tile 1: zeros then elements 16..31);
 // d8 [G][8] half. Same math and order as xmx_q6k_launch (mmq-xmx-q6k.cpp): per 32-group two DPAS on one B (the

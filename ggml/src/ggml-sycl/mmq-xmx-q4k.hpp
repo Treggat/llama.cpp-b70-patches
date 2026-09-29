@@ -62,4 +62,11 @@ void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_te
                                   const int64_t row_high, const int64_t src1_ncols, const int64_t src1_padded_row_size,
                                   const queue_ptr & stream);
 
+// LOCAL (verifystep) GGML_SYCL_XMX_GATEUP: gate and up (two q4_K weights of the same shape, already in the reorder
+// layout, one f32 activation of 1..8 columns) as ONE quantize + ONE matmul launch on the direct kernel. glu = false:
+// gate -> outG, up -> outU (column stride ldd); glu = true: silu(gate) * up -> outG. Returns false (nothing launched)
+// when the pair is not served (direct kernel off, shapes, columns).
+bool ggml_sycl_xmx_q4k_gateup(ggml_backend_sycl_context & ctx, const ggml_tensor * wg, const ggml_tensor * wu,
+                              const ggml_tensor * act, float * outG, float * outU, int64_t ldd, bool glu);
+
 #endif // GGML_SYCL_MMQ_XMX_Q4K_HPP

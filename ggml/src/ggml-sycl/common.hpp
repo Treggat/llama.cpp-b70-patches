@@ -370,6 +370,8 @@ struct mmid_row_mapping {
 };
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+struct ggml_sycl_stamp_set; // [verifystep] GGML_SYCL_NODE_STAMP (ggml-sycl.cpp)
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
@@ -489,6 +491,7 @@ struct ggml_backend_sycl_context {
         bool     no_graph = false;  // recording failed once: always run eagerly
         uint64_t last_use = 0;
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec;
+        std::shared_ptr<ggml_sycl_stamp_set> stamp;  // [verifystep] GGML_SYCL_NODE_STAMP
     };
     std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
     uint64_t graph_cache_epoch = 0;

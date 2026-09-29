@@ -34,4 +34,13 @@ sycl::event ggml_sycl_xmx_q6k_direct16_launch(const uint8_t * ql, const uint8_t 
                                               const int8_t * xa, const sycl::half * d8, float * out, int N, int K, int M,
                                               int64_t ldd, int ks, sycl::queue & q);
 
+// LOCAL (verifystep): two q4_K weights of the same shape (gate, up) against one activation, 1..8 columns, one launch;
+// bit-identical gate / up values to two ggml_sycl_xmx_q4k_direct_launch calls at the same ks. glu: out = silu(gate) * up
+// into outG (outU unused), else gate -> outG, up -> outU.
+sycl::event ggml_sycl_xmx_q4k_direct_pair_launch(const uint8_t * gqs, const uint8_t * gsc, const uint32_t * gdm,
+                                                 const uint8_t * uqs, const uint8_t * usc, const uint32_t * udm,
+                                                 const int8_t * xa, const sycl::half * d8, const int32_t * us, float * outG,
+                                                 float * outU, int N, int K, int M, int64_t ldd, int ks, bool glu,
+                                                 sycl::queue & q);
+
 #endif // GGML_SYCL_MMQ_XMX_DIRECT_HPP

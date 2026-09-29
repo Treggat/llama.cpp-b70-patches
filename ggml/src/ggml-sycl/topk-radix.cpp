@@ -529,3 +529,62 @@ void ggml_sycl_top_k_radix(
         top_k_radix_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, main_stream);
     }
 }
+
+// ---- LOCAL (verifystep) GGML_SYCL_TOPK_BATCH ----
+bool ggml_sycl_top_k_radix_rows(ggml_backend_sycl_context & ctx, const float * src, int32_t * const * dsts, int64_t ncols,
+                                int nrows, int k, dpct::queue_ptr main_stream) {
+    if (nrows < 1 || nrows > 16 || ncols > INT32_MAX) {
+        return false;
+    }
+    const int nparts = top_k_radix_split_groups(ctx.device, ncols, nrows);
+    if (nparts <= 1) {
+        return false;
+    }
+    struct dsts_t { int32_t * d[16]; } dd = {};
+    for (int r = 0; r < nrows; r++) {
+        dd.d[r] = dsts[r];
+    }
+    const int block_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
+    GGML_ASSERT(block_size >= SYCL_TOP_K_RADIX_BUCKETS);
+    const size_t state_words = (size_t) nrows * SYCL_TOP_K_RADIX_ROW_WORDS;
+    ggml_sycl_pool_alloc<uint32_t> state_alloc(ctx.pool(), state_words);
+    uint32_t * state = state_alloc.get();
+    SYCL_CHECK(CHECK_TRY_ERROR(main_stream->memset(state, 0, state_words * sizeof(uint32_t))));
+    const sycl::range<1> block_dims(block_size);
+    const sycl::range<1> grid_dims((size_t) nrows * nparts);
+    bool first = true;
+    for (int shift = 32 - SYCL_TOP_K_RADIX_BITS; shift >= 0; shift -= SYCL_TOP_K_RADIX_BITS) {
+        const bool is_first = first;
+        first = false;
+        main_stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_HIST_SIZE + 4), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<1> item_ct1) {
+                const int g    = item_ct1.get_group(0);
+                const int row  = g / nparts;
+                const int part = g % nparts;
+                top_k_radix_split_pass_f32(src + (int64_t) row * ncols, state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
+                                           (int) ncols, k, shift, is_first, part, nparts,
+                                           slm.get_multi_ptr<sycl::access::decorated::no>().get(), item_ct1);
+            });
+        });
+    }
+    main_stream->submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(8), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<1> item_ct1) {
+            const int g    = item_ct1.get_group(0);
+            const int row  = g / nparts;
+            const int part = g % nparts;
+            int32_t * out = dd.d[0];
+#pragma unroll
+            for (int j = 1; j < 16; ++j) {
+                if (row == j) {
+                    out = dd.d[j];
+                }
+            }
+            top_k_radix_split_emit_f32(src + (int64_t) row * ncols, out, state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
+                                       (int) ncols, k, part, nparts, slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                       item_ct1);
+        });
+    });
+    return true;
+}

@@ -729,6 +729,45 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
     GGML_SYCL_EXIT_OR_RETHROW();
 }
 
+bool ggml_sycl_xmx_q4k_gateup(ggml_backend_sycl_context & ctx, const ggml_tensor * wg, const ggml_tensor * wu,
+                              const ggml_tensor * act, float * outG, float * outU, int64_t ldd, bool glu) try {
+    if (!ggml_sycl_xmx_q4k_direct_env()) {
+        return false;
+    }
+    const int64_t K = wg->ne[0];
+    const int64_t N = wg->ne[1];
+    const int64_t M = act->ne[1];
+    if (M < 1 || M > 8 || wu->ne[0] != K || wu->ne[1] != N || act->ne[0] != K || K % QK_K != 0 || N % XMX_Q4K_ROWS != 0) {
+        return false;
+    }
+    const auto * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    const auto * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    if (!eg || !eu || !eg->optimized_feature.reorder || !eu->optimized_feature.reorder) {
+        return false;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, wg, /*num_src=*/0, " : XMX q4_K gate+up pair");
+    const int64_t G = K / QK8_1;
+    const xmx_q4k_weights a = xmx_q4k_weights_of(static_cast<const char *>(wg->data), N, K);
+    const xmx_q4k_weights b = xmx_q4k_weights_of(static_cast<const char *>(wu->data), N, K);
+    const size_t xa_bytes = (size_t) XQ_TN * K;
+    const size_t d8_bytes = (size_t) XQ_TN * G * sizeof(sycl::half);
+    const size_t us_bytes = (size_t) XQ_TN * G * sizeof(int32_t);
+    ggml_sycl_pool_alloc<char> act_alloc(ctx.pool(), xa_bytes + d8_bytes + us_bytes);
+    int8_t *     xa = reinterpret_cast<int8_t *>(act_alloc.get());
+    sycl::half * d8 = reinterpret_cast<sycl::half *>(act_alloc.get() + xa_bytes);
+    int32_t *    us = reinterpret_cast<int32_t *>(act_alloc.get() + xa_bytes + d8_bytes);
+    sycl::queue & q = *ctx.stream();
+    xmx_q4k_quant_act(static_cast<const float *>(act->data), xa, d8, us, (int) K, (int) M, q, true);
+    const int ks = xmx_q4k_pick_ks((int) N, (int) K, (int) M);   // the single-weight launches' ks (N < 65536 here)
+    ggml_sycl_xmx_q4k_direct_pair_launch(a.qs, a.sc, a.dm, b.qs, b.sc, b.dm, xa, d8, us, outG, outU, (int) N, (int) K,
+                                         (int) M, ldd, ks, glu, q);
+    return true;
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    GGML_SYCL_EXIT_OR_RETHROW();
+    return false;
+}
+
 void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                   ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                   const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
@@ -772,6 +811,11 @@ void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_te
 #else  // !GGML_SYCL_XMX
 
 bool ggml_sycl_xmx_q4k_device_ok(int) { return false; }
+
+bool ggml_sycl_xmx_q4k_gateup(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                              float *, float *, int64_t, bool) {
+    return false;
+}
 
 void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
     GGML_ABORT("XMX q4_K path not built (configure with -DGGML_SYCL_XMX=ON)");

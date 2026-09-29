@@ -6969,6 +6969,31 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// LOCAL (verifystep): the backend sampler's top-k over each output row of a verify batch: one TOP_K node per row
+// (a row view of the logits), each followed by the GET_ROWS of its values (SYCL GGML_SYCL_TOPK_BATCH)
+struct test_topk_rows : public test_case {
+    const int64_t nv;
+    const int nrows;
+    const int k;
+    std::string vars() override { return VARS_TO_STR3(nv, nrows, k); }
+    test_topk_rows(int64_t nv = 248320, int nrows = 8, int k = 20) : nv(nv), nrows(nrows), k(k) {}
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_ROWS"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, nrows);
+        ggml_set_param(logits);
+        ggml_tensor * out = nullptr;
+        for (int r = 0; r < nrows; r++) {
+            ggml_tensor * row = ggml_view_1d(ctx, logits, nv, (size_t) r * nv * sizeof(float));
+            ggml_tensor * tk  = ggml_top_k(ctx, row, k);
+            ggml_tensor * v   = ggml_get_rows(ctx, ggml_reshape_2d(ctx, row, 1, nv), tk);   // [1, k]
+            v = ggml_reshape_2d(ctx, v, k, 1);
+            out = out ? ggml_concat(ctx, out, v, 1) : v;
+        }
+        return out;
+    }
+};
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10501,6 +10526,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // LOCAL (verifystep): per-row TOP_K over the full vocabulary (SYCL GGML_SYCL_TOPK_BATCH)
+    for (int nrows : { 2, 5, 8 }) {
+        test_cases.emplace_back(new test_topk_rows(248320, nrows, 20));
+    }
+    // LOCAL (verifystep): the house model's ffn gate/up pair (q4_K 17408 x 5120) at every verify column count, for the
+    // SYCL XMX gate+up pair kernel (GGML_SYCL_XMX_GATEUP=1/2, bit-identity self-check GGML_SYCL_XMX_GATEUP_CHECK=1)
+    for (int64_t m_batch : { 2, 3, 4, 5, 6, 7, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m_batch, 17408, 5120,
+            false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
 
     // LOCAL (not for upstream): prefill-size q4_K / q6_K at the house model's shapes (SYCL dq-gemm path,
     // GGML_SYCL_DQ_GEMM=1: full 2048-token ubatches, a ragged tail and a 512 ubatch)
@@ -11767,6 +11802,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     if (getenv("DETERM_ONLY")) {
         return make_test_cases_determ();
+    }
+    // LOCAL (verifystep): VERIFYSTEP_ONLY=1 keeps just the verify-step fusion shapes: the ffn gate/up pair + SwiGLU
+    // (q4_K 17408 x 5120) at 2..8 columns
+    if (getenv("VERIFYSTEP_ONLY")) {
+        for (int64_t m_batch : { 2, 4, 6, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m_batch, 17408, 5120,
+                false, 16, 8, false, false, true, false, { 1, 1 }));
+        }
+        // the seat's verify attention: 24 q / 4 kv heads of 256, f16 KV, at the screen depths
+        for (int kv : { 40960, 65536 }) {
+            for (int nb : { 2, 4, 6, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            }
+        }
+        return test_cases;
     }
 
     // LOCAL (prefillx): every op class of one house-model prefill ubatch (Qwen3.8-27B qwen35 Q4_K_M: 48 gated-delta
