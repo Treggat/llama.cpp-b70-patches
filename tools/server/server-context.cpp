@@ -1949,7 +1949,9 @@ private:
                 slot.tgt_topk_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else if (tgt_topk_k > 0 && tgt_topk_k < 1024) {
-                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k) {
+                // a chain is attached at most once (its backend_init asserts on a second call): after a request that
+                // could not use it detached it (logprobs, another sampler order, backend sampling) a new one is made
+                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k || !slot.tgt_topk_set) {
                     llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                     llama_sampler_chain_add(chain, llama_sampler_init_top_k(tgt_topk_k + 1));
                     if (slot.tgt_topk_set) {
